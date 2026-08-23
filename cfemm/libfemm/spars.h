@@ -22,6 +22,9 @@
 #ifndef SPARS_H
 #define SPARS_H
 
+#include <cstddef>
+#include <vector>
+
 class CEntry
 {
 public:
@@ -68,18 +71,38 @@ public:
     bool PCGSolve(int flag);	// flag==true if guess for V present;
     void MultPC(const double *X, double *Y);
     void AddTo(double v, int p, int q);
-    void MultA(double *X, double *Y);
+    void MultA(const double *X, double *Y);
     void SetValue(int i, double x);
     void Periodicity(int i, int j);
     void AntiPeriodicity(int i, int j);
     void Wipe();
-    double Dot(double *X, double *Y);
+    double Dot(const double *X, const double *Y);
     void ComputeBandwidth();
 
 //		CFknDlg *TheView;
 
 private:
+    /**
+     * Pack the linked-list assembly representation into contiguous upper
+     * triangular rows.  Assembly benefits from stable entry addresses, while
+     * PCG traverses the matrix thousands of times and must not pointer-chase
+     * individually allocated entries on every pass.
+     */
+    void rebuildCompactRows();
+    bool solveParallelPCG(int flag);
+    void applyParallelPreconditionerChunk(const double *X, double *Y,
+                                          int begin, int end);
 
+    std::vector<std::size_t> m_rowOffsets;
+    std::vector<int> m_columns;
+    std::vector<double> m_values;
+    std::vector<std::size_t> m_symmetricRowOffsets;
+    std::vector<int> m_symmetricColumns;
+    std::vector<double> m_symmetricValues;
+    bool m_compactRowsDirty = true;
+    int m_parallelThreads = 1;
+    bool m_useJacobi = false;
+    bool m_useParallelPcg = false;
 };
 
 #endif

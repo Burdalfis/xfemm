@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <ios>
 #include <iostream>
+#include <limits>
 
 #ifdef DEBUG_MEX
 #include "mex.h"
@@ -1537,13 +1538,25 @@ void femm::FemmProblem::getCircle(const femm::CArcSegment &arc, CComplex &c, dou
     // convert swept angle from degrees to radians
     double tta = arc.ArcLength * PI / 180.;
 
-    // the radius is half the chord length divided by sin of
-    // half the swept angle (finding the side length of a
-    // triangle formed by the two points and the centre)
-    R = d / (2.*sin(tta/2.));
+    // The radius is half the chord length divided by the sine of half the
+    // swept angle (finding the side length of a triangle formed by the two
+    // points and the centre).
+    const double halfAngle = tta / 2.;
+    R = d / (2. * sin(halfAngle));
+
+    // Clamp exact semicircles before evaluating the legacy expression below.
+    // R*R - d*d/4 catastrophically cancels there: on AArch64 at -O2 its tiny
+    // positive residue moved the centre by about 2e-8 after the square root
+    // and made Triangle's divide-and-conquer triangulation stop progressing.
+    // Retain the legacy expression for other arcs to preserve mesh topology.
+    const double cosine = cos(halfAngle);
+    const double centerOffset =
+        (fabs(cosine) <= std::numeric_limits<double>::epsilon())
+            ? 0.
+            : sqrt(R * R - d * d / 4.);
 
     // center of the arc segment's circle
-    c = a0 + (d/2. + I * sqrt(R*R - d*d / 4.)) * t;
+    c = a0 + (d / 2. + I * centerOffset) * t;
 }
 
 std::string femm::FemmProblem::getTitle() const

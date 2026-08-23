@@ -42,7 +42,7 @@ int FSolver::Harmonic2D(femm::LinearSystemBackend<CComplex> &L,bool verbose)
     CComplex Me[3][3],be[3];		// element matrices;
     double l[3],p[3],q[3];		// element shape parameters;
     int n[3];					// numbers of nodes for a particular element;
-    double a,r,t,x,y,B,res,lastres,ds,Cduct;
+    double a,r,t,x,y,B,res,lastres=0,ds,Cduct;
     CComplex K,mu,dv,B1,B2,v[3],halflag,Jv; //u[3],
     CComplex **Mu,*V_old;
     double c=PI*4.e-05;

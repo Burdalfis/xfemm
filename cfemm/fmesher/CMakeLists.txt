@@ -81,6 +81,13 @@ else()
         add_library(triangle STATIC
             triangle/triangle.c
             )
+        # Triangle's exact-predicate path is sensitive to last-bit differences
+        # for co-circular points.  Match the geometry operation boundaries used
+        # by libfemm instead of allowing AArch64 fused contractions to select a
+        # different triangulation.
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(triangle PRIVATE -ffp-contract=off)
+        endif()
         # a bit of a dirty hack to make the link line nicer:
         add_library(Triangle::triangle-api ALIAS triangle)
         target_include_directories(triangle PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/triangle> $<INSTALL_INTERFACE:include>)

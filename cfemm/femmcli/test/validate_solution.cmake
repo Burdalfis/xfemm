@@ -5,7 +5,10 @@ file(SIZE "${SOLUTION_FILE}" _solution_size)
 if(_solution_size LESS 100)
     message(FATAL_ERROR "Solution file is unexpectedly small: ${_solution_size} bytes")
 endif()
-file(STRINGS "${SOLUTION_FILE}" _solution_marker REGEX "^\[Solution\]$")
-if(NOT _solution_marker)
+# Search the raw text so FEMM's CRLF output and CMake's line handling do not
+# make the section check platform-dependent.
+file(READ "${SOLUTION_FILE}" _solution_text)
+string(FIND "${_solution_text}" "[Solution]" _solution_marker)
+if(_solution_marker EQUAL -1)
     message(FATAL_ERROR "Solution file has no [Solution] section")
 endif()

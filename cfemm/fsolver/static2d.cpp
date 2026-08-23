@@ -58,7 +58,7 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
     double Mx[3][3],My[3][3],Mxy[3][3],Mn[3][3];
     double l[3],p[3],q[3];      // element shape parameters;
     int n[3];                   // numbers of nodes for a particular element;
-    double a,K,Ki,r,t,x,y,B,B1,B2,mu,v[3],u[3],dv,res,lastres,Cduct;
+    double a,K,Ki,r,t,x,y,B,B1,B2,mu,v[3],u[3],dv,res,lastres=0,Cduct;
     double *V_old=nullptr;
     double *CircInt1=nullptr;
     double *CircInt2=nullptr;

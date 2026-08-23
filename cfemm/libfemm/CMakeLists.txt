@@ -33,6 +33,21 @@ add_library(luacomplex
     )
 target_include_directories(luacomplex PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/liblua> $<INSTALL_INTERFACE:include/liblua>)
 
+# Geometry construction repeatedly rotates points using CComplex, and
+# FemmProblem computes circle centres used by that path.  Fused contractions
+# on AArch64 change co-circular coordinates by a few ulps; Triangle can then
+# choose a different topology (and historically failed to terminate for an
+# exactly semicircular arc).  Keep normal optimization while making these two
+# geometry-sensitive translation units use the same operation boundaries on
+# all GCC/Clang targets.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(
+        liblua/femmcomplex.cpp
+        FemmProblem.cpp
+        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off"
+        )
+endif()
+
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/femmversion.h.in"
     "${CMAKE_CURRENT_SOURCE_DIR}/femmversion.h"
@@ -83,6 +98,21 @@ target_include_directories(femm
     $<INSTALL_INTERFACE:include>
     )
 target_link_libraries(femm PUBLIC luacomplex)
+
+# The real-valued PCG backend can use a row-oriented sparse matrix and
+# block-SSOR preconditioner to parallelize one solve without duplicating its
+# mesh and sparse storage. Runtime threading remains opt-in via
+# XFEMM_NUM_THREADS, so existing multi-process workloads do not oversubscribe.
+option(XFEMM_ENABLE_OPENMP "Enable OpenMP in the real-valued PCG backend" ON)
+if(XFEMM_ENABLE_OPENMP)
+    find_package(OpenMP QUIET COMPONENTS CXX)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(femm PUBLIC OpenMP::OpenMP_CXX)
+        target_compile_definitions(femm PRIVATE XFEMM_USE_OPENMP)
+    else()
+        message(STATUS "OpenMP was not found; building the scalar PCG backend")
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # Optional PETSc linear solver backend

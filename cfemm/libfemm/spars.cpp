@@ -25,7 +25,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <utility>
+
+#ifdef XFEMM_USE_OPENMP
+#include <omp.h>
+#endif
 
 using std::swap;
 
@@ -44,6 +49,37 @@ CBigLinProb::CBigLinProb()
     n=0;
     // Best guess for relaxation parameter
     Lambda = 1.5;
+
+#ifdef XFEMM_USE_OPENMP
+    if (const char *threads = std::getenv("XFEMM_NUM_THREADS"))
+    {
+        char *end = nullptr;
+        const long requested = std::strtol(threads, &end, 10);
+        if (end != threads && *end == '\0' && requested > 0 && requested <= 1024)
+            m_parallelThreads = static_cast<int>(requested);
+    }
+    // Contiguous block-SSOR is the threaded default. It preserves most of
+    // SSOR's local coupling without introducing cross-thread dependencies.
+    m_useParallelPcg = m_parallelThreads > 1;
+    if (const char *preconditioner = std::getenv("XFEMM_PCG_PRECONDITIONER"))
+    {
+        if (std::strcmp(preconditioner, "jacobi") == 0)
+        {
+            m_useJacobi = true;
+            m_useParallelPcg = m_parallelThreads > 1;
+        }
+        else if (std::strcmp(preconditioner, "block-ssor") == 0)
+        {
+            m_useJacobi = false;
+            m_useParallelPcg = m_parallelThreads > 1;
+        }
+        else if (std::strcmp(preconditioner, "ssor") == 0)
+        {
+            m_useJacobi = false;
+            m_useParallelPcg = false;
+        }
+    }
+#endif
 }
 
 CBigLinProb::~CBigLinProb()
@@ -106,6 +142,8 @@ void CBigLinProb::Put(double v, int p, int q)
 {
     CEntry *e,*l = NULL;
 
+    m_compactRowsDirty = true;
+
     if (q<p)
         swap(p,q);
 
@@ -164,74 +202,145 @@ void CBigLinProb::AddTo(double v, int p, int q)
 	Put(Get(p,q)+v,p,q);
 }
 
-void CBigLinProb::MultA(double *X, double *Y)
+void CBigLinProb::rebuildCompactRows()
 {
-    int i;
-    CEntry *e;
+    if (!m_compactRowsDirty)
+        return;
 
-    for(i=0; i<n; i++) Y[i]=0;
+    m_rowOffsets.resize(static_cast<std::size_t>(n) + 1);
+    m_columns.clear();
+    m_values.clear();
 
-    for(i=0; i<n; i++)
+    for (int i = 0; i < n; ++i)
     {
-        Y[i]+=M[i]->x*X[i];
-        e=M[i]->next;
-        while(e!=NULL)
+        m_rowOffsets[static_cast<std::size_t>(i)] = m_values.size();
+        for (CEntry *entry = M[i]; entry != NULL; entry = entry->next)
         {
-            Y[i]+=e->x*X[e->c];
-            Y[e->c]+=e->x*X[i];
-            e=e->next;
+            m_columns.push_back(entry->c);
+            m_values.push_back(entry->x);
+        }
+    }
+    m_rowOffsets[static_cast<std::size_t>(n)] = m_values.size();
+
+    // Only the parallel path needs both halves. Scalar SSOR/SpMV uses the
+    // more compact upper triangle and avoids the extra memory traffic.
+    if (!m_useParallelPcg)
+    {
+        m_symmetricRowOffsets.clear();
+        m_symmetricColumns.clear();
+        m_symmetricValues.clear();
+        m_compactRowsDirty = false;
+        return;
+    }
+
+    // Materialize both halves for race-free row-oriented SpMV. Processing
+    // source rows in ascending order also appends every destination row in
+    // ascending column order, matching the legacy accumulation order.
+    m_symmetricRowOffsets.assign(static_cast<std::size_t>(n) + 1, 0);
+    for (int i = 0; i < n; ++i)
+    {
+        const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+        const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+        for (std::size_t j = begin; j < end; ++j)
+        {
+            ++m_symmetricRowOffsets[static_cast<std::size_t>(i) + 1];
+            if (m_columns[j] != i)
+                ++m_symmetricRowOffsets[static_cast<std::size_t>(m_columns[j]) + 1];
+        }
+    }
+    for (int i = 0; i < n; ++i)
+        m_symmetricRowOffsets[static_cast<std::size_t>(i) + 1] +=
+            m_symmetricRowOffsets[static_cast<std::size_t>(i)];
+
+    m_symmetricColumns.resize(m_symmetricRowOffsets.back());
+    m_symmetricValues.resize(m_symmetricRowOffsets.back());
+    std::vector<std::size_t> next = m_symmetricRowOffsets;
+    for (int i = 0; i < n; ++i)
+    {
+        const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+        const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+        for (std::size_t j = begin; j < end; ++j)
+        {
+            const int column = m_columns[j];
+            std::size_t destination = next[static_cast<std::size_t>(i)]++;
+            m_symmetricColumns[destination] = column;
+            m_symmetricValues[destination] = m_values[j];
+            if (column != i)
+            {
+                destination = next[static_cast<std::size_t>(column)]++;
+                m_symmetricColumns[destination] = i;
+                m_symmetricValues[destination] = m_values[j];
+            }
+        }
+    }
+    m_compactRowsDirty = false;
+}
+
+void CBigLinProb::MultA(const double *X, double *Y)
+{
+    rebuildCompactRows();
+
+    for(int i=0; i<n; i++) Y[i]=0.;
+
+    for(int i=0; i<n; i++)
+    {
+        const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+        const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+        Y[i] += m_values[begin] * X[i];
+        for(std::size_t j = begin + 1; j < end; ++j)
+        {
+            const int column = m_columns[j];
+            const double value = m_values[j];
+            Y[i] += value * X[column];
+            Y[column] += value * X[i];
         }
     }
 }
 
-double CBigLinProb::Dot(double *X, double *Y)
+double CBigLinProb::Dot(const double *X, const double *Y)
 {
-    int i;
-    double z;
+    double z=0.;
 
-    for(i=0,z=0; i<n; i++) z+=X[i]*Y[i];
+    for(int i=0; i<n; i++) z+=X[i]*Y[i];
 
     return z;
 }
 
 void CBigLinProb::MultPC(const double *X, double *Y)
 {
-    // Jacobi preconditioner:
-    //	int i;
-    // for(i=0;i<n;i++) Y[i]=X[i]/M[i]->x;
+    rebuildCompactRows();
 
-    // SSOR preconditioner:
-    int i;
-    double c;
-    CEntry *e;
-
-    c= Lambda*(2.-Lambda);
-    for(i=0; i<n; i++) Y[i]=X[i]*c;
-
-    // invert Lower Triangle;
-    for(i=0; i<n; i++)
+    if (m_useJacobi)
     {
-        Y[i]/= M[i]->x;
-        e=M[i]->next;
-        while(e!=NULL)
-        {
-            Y[e->c] -= e->x * Y[i] * Lambda;
-            e=e->next;
-        }
+        for (int i = 0; i < n; ++i)
+            Y[i] = X[i] / m_values[m_rowOffsets[static_cast<std::size_t>(i)]];
+        return;
     }
 
-    for(i=0; i<n; i++) Y[i]*=M[i]->x;
+    const double c = Lambda*(2.-Lambda);
+    for(int i=0; i<n; i++) Y[i]=X[i]*c;
+
+    // invert Lower Triangle;
+    for(int i=0; i<n; i++)
+    {
+        const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+        const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+        Y[i] /= m_values[begin];
+        for(std::size_t j = begin + 1; j < end; ++j)
+            Y[m_columns[j]] -= m_values[j] * Y[i] * Lambda;
+    }
+
+    for(int i=0; i<n; i++)
+        Y[i] *= m_values[m_rowOffsets[static_cast<std::size_t>(i)]];
 
     // invert Upper Triangle
-    for(i=n-1; i>=0; i--)
+    for(int i=n-1; i>=0; i--)
     {
-        e=M[i]->next;
-        while(e!=NULL)
-        {
-            Y[i] -= e->x * Y[e->c] * Lambda;
-            e=e->next;
-        }
-        Y[i]/= M[i]->x;
+        const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+        const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+        for(std::size_t j = begin + 1; j < end; ++j)
+            Y[i] -= m_values[j] * Y[m_columns[j]] * Lambda;
+        Y[i] /= m_values[begin];
     }
 }
 
@@ -252,6 +361,11 @@ bool CBigLinProb::PCGSolve(int flag)
 //	TheView->SetDlgItemText(IDC_FRAME1,"Conjugate Gradient Solver");
 //	TheView->m_prog1.SetPos(0);
     printf("Conjugate Gradient Solver\n");
+
+#ifdef XFEMM_USE_OPENMP
+    if (m_useParallelPcg)
+        return solveParallelPCG(flag);
+#endif
 
     // residual with V=0
     MultPC(b,Z);
@@ -315,6 +429,173 @@ bool CBigLinProb::PCGSolve(int flag)
     return true;
 }
 
+#ifdef XFEMM_USE_OPENMP
+void CBigLinProb::applyParallelPreconditionerChunk(const double *X, double *Y,
+                                                   int begin, int end)
+{
+    if (m_useJacobi)
+    {
+        for (int i = begin; i < end; ++i)
+            Y[i] = X[i] / m_values[m_rowOffsets[static_cast<std::size_t>(i)]];
+        return;
+    }
+
+    const double scale = Lambda * (2. - Lambda);
+    for (int i = begin; i < end; ++i)
+        Y[i] = X[i] * scale;
+
+    for (int i = begin; i < end; ++i)
+    {
+        const std::size_t rowBegin = m_rowOffsets[static_cast<std::size_t>(i)];
+        const std::size_t rowEnd = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+        Y[i] /= m_values[rowBegin];
+        for (std::size_t j = rowBegin + 1; j < rowEnd; ++j)
+        {
+            const int column = m_columns[j];
+            if (column >= end)
+                break;
+            Y[column] -= m_values[j] * Y[i] * Lambda;
+        }
+    }
+
+    for (int i = begin; i < end; ++i)
+        Y[i] *= m_values[m_rowOffsets[static_cast<std::size_t>(i)]];
+
+    for (int i = end - 1; i >= begin; --i)
+    {
+        const std::size_t rowBegin = m_rowOffsets[static_cast<std::size_t>(i)];
+        const std::size_t rowEnd = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+        for (std::size_t j = rowBegin + 1; j < rowEnd; ++j)
+        {
+            const int column = m_columns[j];
+            if (column >= end)
+                break;
+            Y[i] -= m_values[j] * Y[column] * Lambda;
+        }
+        Y[i] /= m_values[rowBegin];
+    }
+}
+
+bool CBigLinProb::solveParallelPCG(int flag)
+{
+    rebuildCompactRows();
+
+    double res_o = 0.;
+    double res = 0.;
+    double res_new = 0.;
+    double pAp = 0.;
+    double del = 0.;
+    double rho = 0.;
+    double er = 0.;
+    bool active = true;
+
+#pragma omp parallel num_threads(m_parallelThreads) \
+    shared(res_o, res, res_new, pAp, del, rho, er, active)
+    {
+        const int thread = omp_get_thread_num();
+        const int threadCount = omp_get_num_threads();
+        const int blockBegin = static_cast<int>(
+            (static_cast<long long>(n) * thread) / threadCount);
+        const int blockEnd = static_cast<int>(
+            (static_cast<long long>(n) * (thread + 1)) / threadCount);
+
+        applyParallelPreconditionerChunk(b, Z, blockBegin, blockEnd);
+#pragma omp barrier
+#pragma omp for schedule(static) reduction(+:res_o)
+        for (int i = 0; i < n; ++i)
+            res_o += Z[i] * b[i];
+
+#pragma omp single
+        active = res_o != 0.;
+
+        if (active)
+        {
+            if (flag == 0)
+            {
+#pragma omp for schedule(static)
+                for (int i = 0; i < n; ++i)
+                    V[i] = 0.;
+            }
+
+#pragma omp for schedule(static)
+            for (int i = 0; i < n; ++i)
+            {
+                const std::size_t begin =
+                    m_symmetricRowOffsets[static_cast<std::size_t>(i)];
+                const std::size_t end =
+                    m_symmetricRowOffsets[static_cast<std::size_t>(i) + 1];
+                double sum = 0.;
+                for (std::size_t j = begin; j < end; ++j)
+                    sum += m_symmetricValues[j] * V[m_symmetricColumns[j]];
+                R[i] = b[i] - sum;
+            }
+
+            applyParallelPreconditionerChunk(R, Z, blockBegin, blockEnd);
+#pragma omp barrier
+#pragma omp single
+            res = 0.;
+#pragma omp for schedule(static) reduction(+:res)
+            for (int i = 0; i < n; ++i)
+            {
+                P[i] = Z[i];
+                res += Z[i] * R[i];
+            }
+
+            do
+            {
+#pragma omp single
+                pAp = 0.;
+#pragma omp for schedule(static) reduction(+:pAp)
+                for (int i = 0; i < n; ++i)
+                {
+                    const std::size_t begin =
+                        m_symmetricRowOffsets[static_cast<std::size_t>(i)];
+                    const std::size_t end =
+                        m_symmetricRowOffsets[static_cast<std::size_t>(i) + 1];
+                    double sum = 0.;
+                    for (std::size_t j = begin; j < end; ++j)
+                        sum += m_symmetricValues[j] * P[m_symmetricColumns[j]];
+                    U[i] = sum;
+                    pAp += P[i] * sum;
+                }
+
+#pragma omp single
+                del = res / pAp;
+
+#pragma omp for schedule(static)
+                for (int i = 0; i < n; ++i)
+                {
+                    V[i] += del * P[i];
+                    R[i] -= del * U[i];
+                }
+
+                applyParallelPreconditionerChunk(R, Z, blockBegin, blockEnd);
+#pragma omp barrier
+#pragma omp single
+                res_new = 0.;
+#pragma omp for schedule(static) reduction(+:res_new)
+                for (int i = 0; i < n; ++i)
+                    res_new += Z[i] * R[i];
+
+#pragma omp single
+                {
+                    rho = res_new / res;
+                    res = res_new;
+                    er = sqrt(res / res_o);
+                }
+
+#pragma omp for schedule(static)
+                for (int i = 0; i < n; ++i)
+                    P[i] = Z[i] + rho * P[i];
+            }
+            while (er > Precision);
+        }
+    }
+
+    return true;
+}
+#endif
+
 void CBigLinProb::SetValue(int i, double x)
 {
     int k,fst,lst;
@@ -361,6 +642,7 @@ void CBigLinProb::Wipe()
         }
         while(e!=NULL);
     }
+    m_compactRowsDirty = true;
 }
 
 void CBigLinProb::AntiPeriodicity(int i, int j)

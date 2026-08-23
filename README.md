@@ -51,6 +51,24 @@ this would be done as
 
 the binary files are found in the xfemm/cfemm/bin directory
 
+### Parallel real-valued solves
+
+When OpenMP is available, the built-in real-valued PCG solver can share one
+mesh and sparse matrix across several threads. Threading is deliberately
+opt-in so that existing multi-process batches are not oversubscribed:
+
+    XFEMM_NUM_THREADS=4 femmcli --lua-base-dir <mfemm dir> --lua-script <script.lua>
+
+A threaded solve uses row-oriented symmetric sparse storage for SpMV and a
+contiguous block-SSOR preconditioner. The scalar default retains the original
+SSOR ordering. `XFEMM_PCG_PRECONDITIONER=jacobi` selects parallel Jacobi for
+comparison; `XFEMM_PCG_PRECONDITIONER=ssor` forces the scalar path. On hybrid
+CPUs, bind one OpenMP thread per physical core for repeatable results, for
+example with `OMP_PROC_BIND=true` and `taskset` on Linux.
+
+OpenMP support is enabled when CMake finds it. Configure with
+`-DXFEMM_ENABLE_OPENMP=OFF` to build without it.
+
 ### Selecting the default mesher backend
 
 The CMake test build uses Triangle by default. To run the complete standard test
