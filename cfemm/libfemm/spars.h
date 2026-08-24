@@ -23,6 +23,7 @@
 #define SPARS_H
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 class CEntry
@@ -78,6 +79,8 @@ public:
     void Wipe();
     double Dot(const double *X, const double *Y);
     void ComputeBandwidth();
+    int lastIterations() const { return m_lastIterations; }
+    double lastRelativeResidual() const { return m_lastRelativeResidual; }
 
 //		CFknDlg *TheView;
 
@@ -92,9 +95,20 @@ private:
     bool solveParallelPCG(int flag);
     void applyParallelPreconditionerChunk(const double *X, double *Y,
                                           int begin, int end);
+    std::size_t mixedWideRowOffset(int row) const
+    {
+        return m_wideRowOffsets16.empty()
+            ? static_cast<std::size_t>(m_wideRowOffsets32[static_cast<std::size_t>(row)])
+            : static_cast<std::size_t>(m_wideRowOffsets16[static_cast<std::size_t>(row)]);
+    }
 
     std::vector<std::size_t> m_rowOffsets;
     std::vector<int> m_columns;
+    std::vector<std::uint16_t> m_columnOffsets16;
+    std::vector<std::uint16_t> m_wideRowOffsets16;
+    std::vector<std::uint32_t> m_wideRowOffsets32;
+    std::vector<int> m_wideColumns;
+    std::vector<int> m_wideRowIndices;
     std::vector<double> m_values;
     std::vector<std::size_t> m_symmetricRowOffsets;
     std::vector<int> m_symmetricColumns;
@@ -103,6 +117,22 @@ private:
     int m_parallelThreads = 1;
     bool m_useJacobi = false;
     bool m_useParallelPcg = false;
+    bool m_useMixedColumnOffsets = false;
+    bool m_useRowColumnOffsets = false;
+    bool m_collectStats = false;
+    bool m_matrixStatsPrinted = false;
+    int m_lastIterations = 0;
+    double m_lastRelativeResidual = -1.;
+    unsigned long long m_solveCount = 0;
+    unsigned long long m_totalIterations = 0;
+    unsigned long long m_spmvCalls = 0;
+    unsigned long long m_preconditionerCalls = 0;
+    unsigned long long m_dotCalls = 0;
+    unsigned long long m_packCalls = 0;
+    double m_spmvSeconds = 0.;
+    double m_preconditionerSeconds = 0.;
+    double m_dotSeconds = 0.;
+    double m_packSeconds = 0.;
 };
 
 #endif

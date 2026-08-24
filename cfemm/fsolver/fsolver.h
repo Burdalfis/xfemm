@@ -61,6 +61,12 @@ class FSolver : public FEASolver<
 // Attributes
 public:
 
+    struct SweepWarmStartState
+    {
+        std::vector<femm::CNode> nodes;
+        std::vector<double> solution;
+    };
+
     FSolver();
     ~FSolver();
 
@@ -114,6 +120,22 @@ public:
 
     virtual bool runSolver(bool verbose=false) override;
 
+    void setSweepWarmStart(const SweepWarmStartState &state)
+    {
+        sweepInitialState = state;
+    }
+    void setPreparedMesh(const femm::mesh::SolverMesh &mesh)
+    {
+        preparedMesh = &mesh;
+    }
+    const SweepWarmStartState &acceptedSweepState() const
+    {
+        return sweepAcceptedState;
+    }
+    bool usedSweepWarmStart() const { return sweepWarmStartUsed; }
+    bool remappedSweepWarmStart() const { return sweepWarmStartRemapped; }
+    int newtonIterations() const { return lastNewtonIterations; }
+
 private:
 
     virtual void CleanUp() override;
@@ -150,6 +172,14 @@ private:
 
     /// Vector containing previous solution for incremental permeability analysis
     std::vector <double> Aprev;
+
+    SweepWarmStartState sweepInitialState;
+    SweepWarmStartState sweepAcceptedState;
+    std::vector<double> sweepMappedInitialSolution;
+    const femm::mesh::SolverMesh *preparedMesh = nullptr;
+    bool sweepWarmStartUsed = false;
+    bool sweepWarmStartRemapped = false;
+    int lastNewtonIterations = 0;
 };
 
 /////////////////////////////////////////////////////////////////////////////

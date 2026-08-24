@@ -30,8 +30,12 @@
 
 #include <lua.h>
 
+#include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -45,6 +49,107 @@
 
 using namespace femm;
 using std::swap;
+
+namespace {
+
+bool environmentEnabled(const char *name)
+{
+    const char *value = std::getenv(name);
+    return value != nullptr &&
+        std::strcmp(value, "0") != 0 &&
+        std::strcmp(value, "false") != 0 &&
+        std::strcmp(value, "off") != 0;
+}
+
+std::string reusableMeshKey(const femm::FemmProblem &problem)
+{
+    std::ostringstream serialized;
+    problem.writeProblemDescription(serialized);
+    std::istringstream input(serialized.str());
+    std::ostringstream normalized;
+    std::string line;
+    while (std::getline(input, line))
+    {
+        if (line.find("<TotalAmps_re>") != std::string::npos)
+            normalized << "<TotalAmps_re>\n";
+        else if (line.find("<TotalAmps_im>") != std::string::npos)
+            normalized << "<TotalAmps_im>\n";
+        else if (line.find("<innerangle>") != std::string::npos)
+            normalized << "<innerangle>\n";
+        else if (line.find("<outerangle>") != std::string::npos)
+            normalized << "<outerangle>\n";
+        else
+            normalized << line << '\n';
+    }
+    return normalized.str();
+}
+
+bool positionReusableAirGaps(femm::mesh::SolverMesh &mesh,
+                             const femm::FemmProblem &problem)
+{
+    for (auto &gap : mesh.airGaps)
+    {
+        const femm::CMBoundaryProp *boundary = nullptr;
+        for (const auto &candidate : problem.lineproplist)
+        {
+            if (candidate->BdryName != gap.boundaryName)
+                continue;
+            boundary = dynamic_cast<const femm::CMBoundaryProp *>(candidate.get());
+            break;
+        }
+        if (boundary == nullptr || gap.totalArcElements == 0 ||
+            gap.innerRing.empty() ||
+            gap.innerRing.size() != gap.outerRing.size())
+            return false;
+
+        const double step = gap.totalArcLengthDegrees / gap.totalArcElements;
+        auto positioned = [step](
+            const std::vector<femm::mesh::SolverMesh::AirGapRingPoint> &topology,
+            double angle) {
+            auto ring = topology;
+            for (auto &point : ring)
+            {
+                point.elementPosition = std::fmod(
+                    point.elementPosition * step + angle, 360.0);
+                if (point.elementPosition < 0)
+                    point.elementPosition += 360.0;
+                point.elementPosition /= step;
+            }
+            std::stable_sort(ring.begin(), ring.end(),
+                [](const femm::mesh::SolverMesh::AirGapRingPoint &lhs,
+                   const femm::mesh::SolverMesh::AirGapRingPoint &rhs) {
+                    return lhs.elementPosition < rhs.elementPosition;
+                });
+            return ring;
+        };
+
+        const auto inner = positioned(gap.innerRing, boundary->InnerAngle);
+        const auto outer = positioned(gap.outerRing, boundary->OuterAngle);
+        const std::size_t fullCount = inner.size();
+        gap.innerShift = inner.front().elementPosition;
+        gap.outerShift = outer.front().elementPosition;
+        gap.quadraturePoints.clear();
+        gap.quadraturePoints.reserve(gap.totalArcElements + 1);
+        for (std::size_t i = 0; i <= gap.totalArcElements; ++i)
+        {
+            const std::size_t p1 = i == fullCount ? 0 : i;
+            if (p1 >= fullCount)
+                return false;
+            const std::size_t p0 = p1 == 0 ? fullCount - 1 : p1 - 1;
+            femm::mesh::SolverMesh::AirGapQuadraturePoint point;
+            point.nodes = {{inner[p0].node, inner[p1].node,
+                            outer[p0].node, outer[p1].node}};
+            point.weights = {{inner[p0].weight, inner[p1].weight,
+                              outer[p0].weight, outer[p1].weight}};
+            gap.quadraturePoints.push_back(point);
+        }
+        gap.innerAngleDegrees = boundary->InnerAngle;
+        gap.outerAngleDegrees = boundary->OuterAngle;
+    }
+    return true;
+}
+
+} // namespace
 
 void femmcli::LuaMagneticsCommands::registerCommands(LuaInstance &li)
 {
@@ -661,6 +766,7 @@ int femmcli::LuaMagneticsCommands::luaAddPointProperty(lua_State *L)
  */
 int femmcli::LuaMagneticsCommands::luaAnalyze(lua_State *L)
 {
+    const auto analyzeStarted = std::chrono::steady_clock::now();
     auto luaInstance = LuaInstance::instance(L);
     std::shared_ptr<FemmState> femmState = std::dynamic_pointer_cast<FemmState>(luaInstance->femmState());
     std::shared_ptr<femm::FemmProblem> doc = femmState->femmDocument();
@@ -790,7 +896,47 @@ int femmcli::LuaMagneticsCommands::luaAnalyze(lua_State *L)
     // allow setting verbosity from lua:
     const bool verbose = (luaInstance->getGlobal("XFEMM_VERBOSE") != 0);
     mesherDoc->Verbose = verbose;
-    if (mesherDoc->HasPeriodicBC()){
+    const bool sweepWarmStartEnabled =
+        environmentEnabled("XFEMM_SWEEP_WARM_START");
+    const bool meshReuseEnabled =
+        environmentEnabled("XFEMM_SWEEP_REUSE_MESH");
+    const bool pcgStatsEnabled = environmentEnabled("XFEMM_PCG_STATS");
+    const auto meshStarted = std::chrono::steady_clock::now();
+    const bool periodic = mesherDoc->HasPeriodicBC();
+    bool meshReused = false;
+    std::shared_ptr<femm::mesh::SolverMesh> preparedMesh;
+
+    if (meshReuseEnabled)
+    {
+        const std::string meshKey = reusableMeshKey(*doc);
+        preparedMesh = femmState->reusableMagneticMesh(meshKey);
+        meshReused = preparedMesh != nullptr;
+        if (preparedMesh == nullptr)
+        {
+            auto meshResult = mesherDoc->generateMesh(pathName, periodic);
+            if (!meshResult.succeeded())
+            {
+                mesherDoc->problem->unselectAll();
+                lua_error(L, "mi_analyze(): triangulation failed!\n");
+                return 0;
+            }
+            // The legacy periodic mesher canonicalizes segment orientation and
+            // spacing in the document. Cache against that post-mesh form so a
+            // subsequent unchanged analysis is recognized as compatible.
+            const std::string canonicalMeshKey = reusableMeshKey(*doc);
+            femmState->setReusableMagneticMesh(
+                canonicalMeshKey, std::move(meshResult.mesh));
+            preparedMesh = femmState->reusableMagneticMesh(canonicalMeshKey);
+        }
+        if (preparedMesh == nullptr ||
+            !positionReusableAirGaps(*preparedMesh, *doc))
+        {
+            lua_error(L, "mi_analyze(): reusable air-gap mesh positioning failed!\n");
+            return 0;
+        }
+    }
+    else if (periodic)
+    {
         if (mesherDoc->DoPeriodicBCTriangulation(pathName) != 0)
         {
             //EndWaitCursor();
@@ -799,14 +945,14 @@ int femmcli::LuaMagneticsCommands::luaAnalyze(lua_State *L)
             return 0;
         }
     }
-    else{
-        if (mesherDoc->DoNonPeriodicBCTriangulation(pathName) != 0)
-        {
-            //EndWaitCursor();
-            lua_error(L, "mi_analyze(): Nonperiodic BC triangulation failed!\n");
-            return 0;
-        }
+    else if (mesherDoc->DoNonPeriodicBCTriangulation(pathName) != 0)
+    {
+        //EndWaitCursor();
+        lua_error(L, "mi_analyze(): Nonperiodic BC triangulation failed!\n");
+        return 0;
     }
+    const double meshSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - meshStarted).count();
     //EndWaitCursor();
     if (!doc->consistencyCheckOK())
     {
@@ -822,6 +968,13 @@ int femmcli::LuaMagneticsCommands::luaAnalyze(lua_State *L)
     theFSolver.PrintMessage = &PrintWarningMsg;
     // not supported yet, but set the previous solution so that we can detect this case afterwards:
     theFSolver.previousSolutionFile = doc->previousSolutionFile;
+    if (preparedMesh != nullptr)
+        theFSolver.setPreparedMesh(*preparedMesh);
+    const FSolver::SweepWarmStartState *sweepWarmStart =
+        sweepWarmStartEnabled ? femmState->magneticWarmStart() : nullptr;
+    const bool sweepWarmStartAvailable = sweepWarmStart != nullptr;
+    if (sweepWarmStart != nullptr)
+        theFSolver.setSweepWarmStart(*sweepWarmStart);
     if (!theFSolver.LoadProblemFile())
     {
         lua_error(L, "mi_analyze(): problem initializing solver!");
@@ -839,6 +992,40 @@ int femmcli::LuaMagneticsCommands::luaAnalyze(lua_State *L)
     if (!theFSolver.runSolver(verbose))
     {
         lua_error(L, "solver failed.");
+    }
+    if (sweepWarmStartEnabled)
+    {
+        femmState->setMagneticWarmStart(theFSolver.acceptedSweepState());
+        std::cerr << "XFEMM_SWEEP_WARM_START available="
+                  << (sweepWarmStartAvailable ? "yes" : "no")
+                  << " used="
+                  << (theFSolver.usedSweepWarmStart() ? "yes" : "no")
+                  << " remapped="
+                  << (theFSolver.remappedSweepWarmStart() ? "yes" : "no")
+                  << " nodes=" << theFSolver.acceptedSweepState().solution.size()
+                  << "\n";
+    }
+    if (meshReuseEnabled)
+    {
+        std::cerr << "XFEMM_SWEEP_MESH_REUSE reused="
+                  << (meshReused ? "yes" : "no")
+                  << " nodes=" << preparedMesh->nodes.size()
+                  << " elements=" << preparedMesh->elements.size()
+                  << " mesh_s=" << meshSeconds
+                  << "\n";
+    }
+    if (pcgStatsEnabled || sweepWarmStartEnabled || meshReuseEnabled)
+    {
+        const double wallSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - analyzeStarted).count();
+        std::cerr << "XFEMM_ANALYZE_STATS wall_s=" << wallSeconds
+                  << " newton_iterations=" << theFSolver.newtonIterations()
+                  << " warm_start="
+                  << (theFSolver.usedSweepWarmStart() ? "yes" : "no")
+                  << " remapped="
+                  << (theFSolver.remappedSweepWarmStart() ? "yes" : "no")
+                  << " mesh_reused=" << (meshReused ? "yes" : "no")
+                  << "\n";
     }
     return 0;
 }

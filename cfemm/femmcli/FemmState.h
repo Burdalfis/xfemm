@@ -26,6 +26,7 @@
 #include "PostProcessor.h"
 
 #include <memory>
+#include <string>
 
 namespace femmcli
 {
@@ -142,11 +143,21 @@ public:
      * @return \c true, if a problem set is active, \c false otherwise.
      */
     bool isValid() const;
+
+    const FSolver::SweepWarmStartState *magneticWarmStart() const;
+    void setMagneticWarmStart(FSolver::SweepWarmStartState state);
+    std::shared_ptr<femm::mesh::SolverMesh> reusableMagneticMesh(
+        const std::string &key) const;
+    void setReusableMagneticMesh(std::string key,
+                                 femm::mesh::SolverMesh mesh);
 private:
     struct ProblemSet {
         std::shared_ptr<femm::FemmProblem> document;
         std::shared_ptr<fmesher::FMesher> mesher;
         std::shared_ptr<femm::PProcIface> postProcessor;
+        std::shared_ptr<FSolver::SweepWarmStartState> magneticWarmStart;
+        std::string magneticMeshKey;
+        std::shared_ptr<femm::mesh::SolverMesh> magneticMesh;
     };
 
     ProblemSet current;

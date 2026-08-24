@@ -69,6 +69,48 @@ example with `OMP_PROC_BIND=true` and `taskset` on Linux.
 OpenMP support is enabled when CMake finds it. Configure with
 `-DXFEMM_ENABLE_OPENMP=OFF` to build without it.
 
+Set `XFEMM_PCG_STATS=1` to print one diagnostic record per real-valued PCG
+solve plus a process total. The records include Krylov iteration counts,
+relative residuals, time and call counts for sparse matrix-vector products,
+preconditioner applications and dot products, packed-matrix size, and
+post-reordering bandwidth statistics. Diagnostics are disabled by default.
+
+The scalar SSOR relaxation factor remains 1.5 by default. Experiments can
+override it with `XFEMM_PCG_LAMBDA=<value>`, where the value must be finite and
+strictly between 0 and 2.
+
+For data-layout experiments, `XFEMM_PCG_COLUMN_INDEX=mixed16` stores scalar
+PCG column indices primarily as 16-bit row-relative offsets, with an exact
+absolute-column escape representation for wider entries. The production
+default remains `int32`; current Pi4/Pi5 measurements favor that default, and
+the mixed representation is ignored by parallel PCG.
+
+`XFEMM_PCG_COLUMN_INDEX=row16` selects a row-granularity experiment. Rows
+whose relative offsets all fit in 16 bits use a branch-free uint16 kernel;
+rows containing a wider offset retain ordinary int32 columns. The kernel is
+selected once per row. ARM benchmarks found lower cache traffic but no
+consistent wall-time improvement, so the production default remains `int32`.
+
+### Experimental sweep continuation
+
+`XFEMM_SWEEP_WARM_START=1` lets consecutive planar magnetostatic
+`mi_analyze()` calls in one `femmcli` process seed the next nonlinear solve
+with the previously accepted nodal solution. The state is kept only for the
+active magnetic document. It is reused only when the newly generated mesh has
+an exact, unambiguous node-coordinate match; otherwise the solver safely falls
+back to a cold initial field. With `XFEMM_PCG_STATS=1`, each analysis also
+reports whether continuation was used, its Newton count, and its wall time.
+
+`XFEMM_SWEEP_REUSE_MESH=1` additionally retains the in-memory mesh for an
+unchanged magnetic document. Circuit amplitudes and air-gap inner/outer angles
+are deliberately excluded from the mesh-compatibility key. Sliding-band
+quadrature is regenerated from position-independent ring topology on every
+operating point. Any other serialized model change invalidates the mesh and
+forces a fresh triangulation. `XFEMM_SWEEP_MESH_REUSE` diagnostics report the
+decision, mesh size, and mesh preparation time. Mesh reuse and warm starting
+are independent opt-ins; production sweeps normally enable both. Node ordering,
+symbolic matrix structure, and preconditioners are not yet retained.
+
 ### Selecting the default mesher backend
 
 The CMake test build uses Triangle by default. To run the complete standard test

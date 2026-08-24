@@ -47,6 +47,7 @@
 #include <iostream>
 #include <malloc.h>
 #include <math.h>
+#include <numeric>
 #include <sstream>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1033,7 +1034,7 @@ double FSolver::ElmArea(int i)
 bool FSolver::runSolver(bool verbose)
 {
     // load mesh
-    LoadMeshErr err = LoadMesh();
+    LoadMeshErr err = preparedMesh != nullptr ? LoadMesh(*preparedMesh) : LoadMesh();
     if (err != NOERROR)
     {
         WarnMessage(getErrorString(err).c_str());
@@ -1045,10 +1046,98 @@ bool FSolver::runSolver(bool verbose)
     {
         if (verbose) PrintMessage("renumbering nodes using Cuthill-McKee method\n");
 
-        if (!Cuthill())
+        int reordered = 0;
+        if (preparedMesh != nullptr)
+        {
+            std::vector<std::pair<std::size_t, std::size_t>> connectivity;
+            connectivity.reserve(preparedMesh->edges.size());
+            for (const auto &edge : preparedMesh->edges)
+                connectivity.emplace_back(edge.first, edge.second);
+            reordered = Cuthill(connectivity);
+        }
+        else
+            reordered = Cuthill();
+
+        if (!reordered)
         {
             WarnMessage("problem renumbering node points\n");
             return false;
+        }
+    }
+
+    sweepWarmStartUsed = false;
+    sweepWarmStartRemapped = false;
+    sweepMappedInitialSolution.clear();
+    if (Frequency == 0 && ProblemType == PLANAR &&
+        sweepInitialState.nodes.size() == meshnode.size() &&
+        sweepInitialState.solution.size() == meshnode.size())
+    {
+        const auto sameNode = [](const femm::CNode &lhs,
+                                 const femm::CNode &rhs) {
+            return lhs.x == rhs.x && lhs.y == rhs.y &&
+                   lhs.BoundaryMarker == rhs.BoundaryMarker &&
+                   lhs.InConductor == rhs.InConductor;
+        };
+        const auto nodeLess = [](const femm::CNode &lhs,
+                                 const femm::CNode &rhs) {
+            if (lhs.x != rhs.x) return lhs.x < rhs.x;
+            if (lhs.y != rhs.y) return lhs.y < rhs.y;
+            if (lhs.BoundaryMarker != rhs.BoundaryMarker)
+                return lhs.BoundaryMarker < rhs.BoundaryMarker;
+            return lhs.InConductor < rhs.InConductor;
+        };
+
+        bool orderedMatch = true;
+        for (std::size_t i = 0; i < meshnode.size(); ++i)
+        {
+            if (!sameNode(sweepInitialState.nodes[i], meshnode[i]))
+            {
+                orderedMatch = false;
+                break;
+            }
+        }
+
+        if (orderedMatch)
+        {
+            sweepMappedInitialSolution = sweepInitialState.solution;
+            sweepWarmStartUsed = true;
+        }
+        else
+        {
+            std::vector<std::size_t> beforeOrder(meshnode.size());
+            std::vector<std::size_t> nowOrder(meshnode.size());
+            std::iota(beforeOrder.begin(), beforeOrder.end(), 0);
+            std::iota(nowOrder.begin(), nowOrder.end(), 0);
+            std::sort(beforeOrder.begin(), beforeOrder.end(),
+                      [&](std::size_t lhs, std::size_t rhs) {
+                          return nodeLess(sweepInitialState.nodes[lhs],
+                                          sweepInitialState.nodes[rhs]);
+                      });
+            std::sort(nowOrder.begin(), nowOrder.end(),
+                      [&](std::size_t lhs, std::size_t rhs) {
+                          return nodeLess(meshnode[lhs], meshnode[rhs]);
+                      });
+
+            sweepMappedInitialSolution.resize(meshnode.size());
+            sweepWarmStartUsed = true;
+            for (std::size_t k = 0; k < meshnode.size(); ++k)
+            {
+                const std::size_t before = beforeOrder[k];
+                const std::size_t now = nowOrder[k];
+                if (!sameNode(sweepInitialState.nodes[before], meshnode[now]) ||
+                    (k > 0 &&
+                     (sameNode(sweepInitialState.nodes[beforeOrder[k - 1]],
+                               sweepInitialState.nodes[before]) ||
+                      sameNode(meshnode[nowOrder[k - 1]], meshnode[now]))))
+                {
+                    sweepWarmStartUsed = false;
+                    sweepMappedInitialSolution.clear();
+                    break;
+                }
+                sweepMappedInitialSolution[now] =
+                    sweepInitialState.solution[before];
+            }
+            sweepWarmStartRemapped = sweepWarmStartUsed;
         }
     }
 
@@ -1085,6 +1174,10 @@ bool FSolver::runSolver(bool verbose)
             return false;
         }
 
+        if (sweepWarmStartUsed)
+            std::copy(sweepMappedInitialSolution.begin(),
+                      sweepMappedInitialSolution.end(), L->solution().begin());
+
         // Create element matrices and solve the problem;
         if (ProblemType == PLANAR)
         {
@@ -1094,6 +1187,9 @@ bool FSolver::runSolver(bool verbose)
                 WarnMessage("Couldn't solve the problem\n");
                 return false;
             }
+            sweepAcceptedState.nodes = meshnode;
+            sweepAcceptedState.solution.assign(L->solution().begin(),
+                                               L->solution().end());
             if (verbose)
                 PrintMessage("Static 2-D problem solved\n");
         } else {

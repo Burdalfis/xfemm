@@ -2,7 +2,10 @@
 
 #include <array>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <vector>
 
 namespace {
 
@@ -64,10 +67,41 @@ int main()
     problem.b[2] = 19;
     problem.Precision = 1.e-12;
     ok &= problem.PCGSolve(0);
+    if (problem.lastIterations() <= 0 ||
+        problem.lastRelativeResidual() > problem.Precision) {
+        std::cerr << "invalid PCG diagnostics: iterations="
+                  << problem.lastIterations() << ", relative residual="
+                  << problem.lastRelativeResidual() << '\n';
+        ok = false;
+    }
     for (std::size_t i = 0; i < input.size(); ++i) {
         if (!close(problem.V[i], input[i], 1.e-10)) {
             std::cerr << "solution[" << i << "]: expected " << input[i]
                       << ", got " << problem.V[i] << '\n';
+            ok = false;
+        }
+    }
+
+    // Exercise the escape representation at the reserved 16-bit sentinel.
+    const char *columnIndex = std::getenv("XFEMM_PCG_COLUMN_INDEX");
+    if (columnIndex != nullptr &&
+        (std::strcmp(columnIndex, "mixed16") == 0 ||
+         std::strcmp(columnIndex, "row16") == 0)) {
+        constexpr int last = 65535;
+        CBigLinProb wideProblem;
+        if (!wideProblem.Create(last + 1, 0))
+            return 1;
+        wideProblem.Put(2., 0, last);
+        std::vector<double> wideInput(static_cast<std::size_t>(last) + 1, 0.);
+        std::vector<double> wideProduct(wideInput.size(), 0.);
+        wideInput[0] = 3.;
+        wideInput[static_cast<std::size_t>(last)] = 5.;
+        wideProblem.MultA(wideInput.data(), wideProduct.data());
+        if (!close(wideProduct[0], 10.) ||
+            !close(wideProduct[static_cast<std::size_t>(last)], 6.)) {
+            std::cerr << "16-bit wide-column product: expected [10, 6], got ["
+                      << wideProduct[0] << ", "
+                      << wideProduct[static_cast<std::size_t>(last)] << "]\n";
             ok = false;
         }
     }

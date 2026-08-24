@@ -23,6 +23,7 @@
 #include "hpproc.h"
 
 #include <memory>
+#include <utility>
 
 
 const std::shared_ptr<femm::FemmProblem> femmcli::FemmState::femmDocument()
@@ -72,6 +73,9 @@ void femmcli::FemmState::close()
     current.document.reset();
     current.mesher.reset();
     current.postProcessor.reset();
+    current.magneticWarmStart.reset();
+    current.magneticMeshKey.clear();
+    current.magneticMesh.reset();
 }
 
 void femmcli::FemmState::deactivateProblemSet()
@@ -103,4 +107,31 @@ bool femmcli::FemmState::activateProblemSet(const std::string &title)
 bool femmcli::FemmState::isValid() const
 {
     return (nullptr != current.document.get());
+}
+
+const FSolver::SweepWarmStartState *femmcli::FemmState::magneticWarmStart() const
+{
+    return current.magneticWarmStart.get();
+}
+
+void femmcli::FemmState::setMagneticWarmStart(FSolver::SweepWarmStartState state)
+{
+    current.magneticWarmStart =
+        std::make_shared<FSolver::SweepWarmStartState>(std::move(state));
+}
+
+std::shared_ptr<femm::mesh::SolverMesh>
+femmcli::FemmState::reusableMagneticMesh(const std::string &key) const
+{
+    if (key != current.magneticMeshKey)
+        return nullptr;
+    return current.magneticMesh;
+}
+
+void femmcli::FemmState::setReusableMagneticMesh(
+    std::string key, femm::mesh::SolverMesh mesh)
+{
+    current.magneticMeshKey = std::move(key);
+    current.magneticMesh =
+        std::make_shared<femm::mesh::SolverMesh>(std::move(mesh));
 }

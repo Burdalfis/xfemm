@@ -10,6 +10,18 @@ target_link_libraries(spars_compact_test PRIVATE femm)
 add_test(NAME spars_compact COMMAND spars_compact_test)
 set_tests_properties(spars_compact PROPERTIES LABELS "libfemm;unit")
 
+add_test(NAME spars_compact_mixed16 COMMAND spars_compact_test)
+set_tests_properties(spars_compact_mixed16 PROPERTIES
+    LABELS "libfemm;unit"
+    ENVIRONMENT "XFEMM_PCG_COLUMN_INDEX=mixed16"
+    )
+
+add_test(NAME spars_compact_row16 COMMAND spars_compact_test)
+set_tests_properties(spars_compact_row16 PROPERTIES
+    LABELS "libfemm;unit"
+    ENVIRONMENT "XFEMM_PCG_COLUMN_INDEX=row16"
+    )
+
 if(XFEMM_ENABLE_OPENMP AND OpenMP_CXX_FOUND)
     add_test(NAME spars_compact_parallel COMMAND spars_compact_test)
     set_tests_properties(spars_compact_parallel PROPERTIES

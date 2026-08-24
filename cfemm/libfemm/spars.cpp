@@ -22,10 +22,13 @@
 #include "femmcomplex.h"
 #include "spars.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <utility>
 
 #ifdef XFEMM_USE_OPENMP
@@ -50,6 +53,27 @@ CBigLinProb::CBigLinProb()
     // Best guess for relaxation parameter
     Lambda = 1.5;
 
+    if (const char *stats = std::getenv("XFEMM_PCG_STATS"))
+        m_collectStats = stats[0] != '\0' && std::strcmp(stats, "0") != 0;
+
+    if (const char *relaxation = std::getenv("XFEMM_PCG_LAMBDA"))
+    {
+        char *end = nullptr;
+        const double requested = std::strtod(relaxation, &end);
+        if (end != relaxation && *end == '\0' && std::isfinite(requested) &&
+            requested > 0. && requested < 2.)
+        {
+            Lambda = requested;
+        }
+        else
+        {
+            std::fprintf(stderr,
+                         "Ignoring invalid XFEMM_PCG_LAMBDA='%s'; expected "
+                         "a finite value between 0 and 2\n",
+                         relaxation);
+        }
+    }
+
 #ifdef XFEMM_USE_OPENMP
     if (const char *threads = std::getenv("XFEMM_NUM_THREADS"))
     {
@@ -61,6 +85,8 @@ CBigLinProb::CBigLinProb()
     // Contiguous block-SSOR is the threaded default. It preserves most of
     // SSOR's local coupling without introducing cross-thread dependencies.
     m_useParallelPcg = m_parallelThreads > 1;
+#endif
+
     if (const char *preconditioner = std::getenv("XFEMM_PCG_PRECONDITIONER"))
     {
         if (std::strcmp(preconditioner, "jacobi") == 0)
@@ -79,11 +105,42 @@ CBigLinProb::CBigLinProb()
             m_useParallelPcg = false;
         }
     }
-#endif
+
+    if (const char *columnIndex = std::getenv("XFEMM_PCG_COLUMN_INDEX"))
+    {
+        if (std::strcmp(columnIndex, "mixed16") == 0)
+            m_useMixedColumnOffsets = true;
+        else if (std::strcmp(columnIndex, "row16") == 0)
+            m_useRowColumnOffsets = true;
+        else if (columnIndex[0] != '\0' && std::strcmp(columnIndex, "int32") != 0)
+            std::fprintf(stderr,
+                         "Ignoring invalid XFEMM_PCG_COLUMN_INDEX='%s'; "
+                         "expected int32, mixed16, or row16\n",
+                         columnIndex);
+    }
+
+    if ((m_useMixedColumnOffsets || m_useRowColumnOffsets) && m_useParallelPcg)
+    {
+        std::fprintf(stderr,
+                     "16-bit XFEMM_PCG_COLUMN_INDEX modes apply only to "
+                     "scalar PCG; using int32 for the parallel solver\n");
+        m_useMixedColumnOffsets = false;
+        m_useRowColumnOffsets = false;
+    }
 }
 
 CBigLinProb::~CBigLinProb()
 {
+    if (m_collectStats && m_solveCount != 0)
+    {
+        std::fprintf(stderr,
+                     "XFEMM_PCG_TOTAL solves=%llu iterations=%llu lambda=%.9g "
+                     "pack_s=%.6f spmv_s=%.6f preconditioner_s=%.6f "
+                     "dot_s=%.6f\n",
+                     m_solveCount, m_totalIterations, Lambda, m_packSeconds,
+                     m_spmvSeconds, m_preconditionerSeconds, m_dotSeconds);
+    }
+
     if (n==0) return;
 
     int i;
@@ -207,8 +264,17 @@ void CBigLinProb::rebuildCompactRows()
     if (!m_compactRowsDirty)
         return;
 
+    const auto packStarted = m_collectStats
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+
     m_rowOffsets.resize(static_cast<std::size_t>(n) + 1);
     m_columns.clear();
+    m_columnOffsets16.clear();
+    m_wideRowOffsets16.clear();
+    m_wideRowOffsets32.clear();
+    m_wideColumns.clear();
+    m_wideRowIndices.clear();
     m_values.clear();
 
     for (int i = 0; i < n; ++i)
@@ -222,6 +288,194 @@ void CBigLinProb::rebuildCompactRows()
     }
     m_rowOffsets[static_cast<std::size_t>(n)] = m_values.size();
 
+    if (m_useMixedColumnOffsets)
+    {
+        const std::uint16_t escape = std::numeric_limits<std::uint16_t>::max();
+        m_columnOffsets16.resize(m_columns.size());
+        std::vector<std::uint32_t> wideRowOffsets(
+            static_cast<std::size_t>(n) + 1, 0);
+        for (int i = 0; i < n; ++i)
+        {
+            const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+            const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+            wideRowOffsets[static_cast<std::size_t>(i)] =
+                static_cast<std::uint32_t>(m_wideColumns.size());
+            for (std::size_t j = begin; j < end; ++j)
+            {
+                const int offset = m_columns[j] - i;
+                if (offset >= 0 && offset < static_cast<int>(escape))
+                {
+                    m_columnOffsets16[j] = static_cast<std::uint16_t>(offset);
+                }
+                else
+                {
+                    m_columnOffsets16[j] = escape;
+                    m_wideColumns.push_back(m_columns[j]);
+                }
+            }
+        }
+        wideRowOffsets[static_cast<std::size_t>(n)] =
+            static_cast<std::uint32_t>(m_wideColumns.size());
+
+        if (m_wideColumns.size() <=
+            static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()))
+        {
+            m_wideRowOffsets16.resize(wideRowOffsets.size());
+            std::transform(wideRowOffsets.begin(), wideRowOffsets.end(),
+                           m_wideRowOffsets16.begin(),
+                           [](std::uint32_t offset) {
+                               return static_cast<std::uint16_t>(offset);
+                           });
+        }
+        else
+        {
+            m_wideRowOffsets32.swap(wideRowOffsets);
+        }
+    }
+    else if (m_useRowColumnOffsets)
+    {
+        m_columnOffsets16.reserve(m_columns.size());
+        for (int i = 0; i < n; ++i)
+        {
+            const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+            const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+            bool wideRow = false;
+            for (std::size_t j = begin + 1; j < end; ++j)
+            {
+                if (m_columns[j] - i >
+                    static_cast<int>(std::numeric_limits<std::uint16_t>::max()))
+                {
+                    wideRow = true;
+                    break;
+                }
+            }
+            if (wideRow)
+                m_wideRowIndices.push_back(i);
+            for (std::size_t j = begin; j < end; ++j)
+            {
+                if (wideRow)
+                    m_wideColumns.push_back(m_columns[j]);
+                else
+                    m_columnOffsets16.push_back(
+                        static_cast<std::uint16_t>(m_columns[j] - i));
+            }
+        }
+    }
+
+    if (m_collectStats && !m_matrixStatsPrinted)
+    {
+        std::vector<int> bandwidths;
+        bandwidths.reserve(m_columns.size() > static_cast<std::size_t>(n)
+                               ? m_columns.size() - static_cast<std::size_t>(n)
+                               : 0);
+        unsigned long long bandwidthSum = 0;
+        std::size_t wideBandwidthCount = 0;
+        std::size_t wideRowCount = 0;
+        std::size_t wideRowNnz = 0;
+        int maximumBandwidth = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+            const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+            bool wideRow = false;
+            for (std::size_t j = begin + 1; j < end; ++j)
+            {
+                const int bandwidth = m_columns[j] - i;
+                bandwidths.push_back(bandwidth);
+                bandwidthSum += static_cast<unsigned long long>(bandwidth);
+                if (bandwidth > 65535)
+                {
+                    ++wideBandwidthCount;
+                    wideRow = true;
+                }
+                maximumBandwidth = std::max(maximumBandwidth, bandwidth);
+            }
+            if (wideRow)
+            {
+                ++wideRowCount;
+                wideRowNnz += end - begin;
+            }
+        }
+        std::sort(bandwidths.begin(), bandwidths.end());
+        const auto percentile = [&bandwidths](double fraction) {
+            if (bandwidths.empty())
+                return 0;
+            const std::size_t index = static_cast<std::size_t>(
+                fraction * static_cast<double>(bandwidths.size() - 1));
+            return bandwidths[index];
+        };
+        std::size_t columnBytes = m_columns.size() * sizeof(m_columns[0]);
+        if (m_useRowColumnOffsets)
+        {
+            columnBytes =
+                m_columnOffsets16.size() * sizeof(m_columnOffsets16[0]) +
+                m_wideColumns.size() * sizeof(m_wideColumns[0]) +
+                m_wideRowIndices.size() * sizeof(m_wideRowIndices[0]);
+        }
+        else if (m_useMixedColumnOffsets)
+        {
+            columnBytes =
+                m_columnOffsets16.size() * sizeof(m_columnOffsets16[0]) +
+                m_wideRowOffsets16.size() * sizeof(m_wideRowOffsets16[0]) +
+                m_wideRowOffsets32.size() * sizeof(m_wideRowOffsets32[0]) +
+                m_wideColumns.size() * sizeof(m_wideColumns[0]);
+        }
+        const std::size_t packedBytes =
+            m_rowOffsets.size() * sizeof(m_rowOffsets[0]) +
+            columnBytes + m_values.size() * sizeof(m_values[0]);
+        const std::size_t rowHybridBytesWithoutTags =
+            m_rowOffsets.size() * sizeof(m_rowOffsets[0]) +
+            m_values.size() * sizeof(m_values[0]) +
+            (m_columns.size() - wideRowNnz) * sizeof(std::uint16_t) +
+            wideRowNnz * sizeof(m_columns[0]);
+        const std::size_t rowHybridTaggedBytes =
+            rowHybridBytesWithoutTags + static_cast<std::size_t>(n);
+        const std::size_t rowHybridBytes =
+            rowHybridBytesWithoutTags + wideRowCount * sizeof(int);
+        const double meanBandwidth = bandwidths.empty()
+            ? 0.
+            : static_cast<double>(bandwidthSum) /
+                  static_cast<double>(bandwidths.size());
+        std::fprintf(
+            stderr,
+            "XFEMM_PCG_MATRIX n=%d upper_nnz=%zu offdiag_nnz=%zu lambda=%.9g "
+            "packed_bytes=%zu bandwidth_max=%d bandwidth_mean=%.3f "
+            "bandwidth_p50=%d bandwidth_p90=%d bandwidth_p95=%d "
+            "bandwidth_p99=%d bandwidth_over_uint16=%zu "
+            "bandwidth_over_uint16_pct=%.6f uint16_offsets=%s "
+            "wide_rows=%zu wide_rows_pct=%.6f wide_row_nnz=%zu "
+            "wide_row_nnz_pct=%.6f row_hybrid_bytes_no_row_map=%zu "
+            "row_hybrid_tagged_bytes=%zu row_hybrid_bytes=%zu "
+            "column_index=%s wide_columns=%zu "
+            "wide_row_offset_bits=%d\n",
+            n, m_values.size(), bandwidths.size(), Lambda, packedBytes,
+            maximumBandwidth, meanBandwidth, percentile(0.50),
+            percentile(0.90), percentile(0.95), percentile(0.99),
+            wideBandwidthCount,
+            bandwidths.empty()
+                ? 0.
+                : 100. * static_cast<double>(wideBandwidthCount) /
+                      static_cast<double>(bandwidths.size()),
+            maximumBandwidth <= 65535 ? "yes" : "no",
+            wideRowCount,
+            n == 0 ? 0. : 100. * static_cast<double>(wideRowCount) /
+                                  static_cast<double>(n),
+            wideRowNnz,
+            m_columns.empty()
+                ? 0.
+                : 100. * static_cast<double>(wideRowNnz) /
+                      static_cast<double>(m_columns.size()),
+            rowHybridBytesWithoutTags, rowHybridTaggedBytes, rowHybridBytes,
+            m_useRowColumnOffsets
+                ? "row16"
+                : (m_useMixedColumnOffsets ? "mixed16" : "int32"),
+            m_wideColumns.size(),
+            m_useMixedColumnOffsets
+                ? (m_wideRowOffsets16.empty() ? 32 : 16)
+                : 0);
+        m_matrixStatsPrinted = true;
+    }
+
     // Only the parallel path needs both halves. Scalar SSOR/SpMV uses the
     // more compact upper triangle and avoids the extra memory traffic.
     if (!m_useParallelPcg)
@@ -229,7 +483,15 @@ void CBigLinProb::rebuildCompactRows()
         m_symmetricRowOffsets.clear();
         m_symmetricColumns.clear();
         m_symmetricValues.clear();
+        if (m_useMixedColumnOffsets || m_useRowColumnOffsets)
+            std::vector<int>().swap(m_columns);
         m_compactRowsDirty = false;
+        if (m_collectStats)
+        {
+            ++m_packCalls;
+            m_packSeconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - packStarted).count();
+        }
         return;
     }
 
@@ -274,73 +536,316 @@ void CBigLinProb::rebuildCompactRows()
         }
     }
     m_compactRowsDirty = false;
+    if (m_collectStats)
+    {
+        ++m_packCalls;
+        m_packSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - packStarted).count();
+    }
 }
 
 void CBigLinProb::MultA(const double *X, double *Y)
 {
     rebuildCompactRows();
+    const auto started = m_collectStats
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
 
     for(int i=0; i<n; i++) Y[i]=0.;
 
-    for(int i=0; i<n; i++)
+    if (m_useRowColumnOffsets)
     {
-        const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
-        const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
-        Y[i] += m_values[begin] * X[i];
-        for(std::size_t j = begin + 1; j < end; ++j)
+        std::size_t narrowIndex = 0;
+        std::size_t wideIndex = 0;
+        const auto multiplyNarrowRow = [&](int i)
         {
-            const int column = m_columns[j];
-            const double value = m_values[j];
-            Y[i] += value * X[column];
-            Y[column] += value * X[i];
+            const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+            const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+            const std::size_t rowNnz = end - begin;
+            Y[i] += m_values[begin] * X[i];
+            const std::uint16_t *offsets =
+                m_columnOffsets16.data() + narrowIndex;
+            for (std::size_t k = 1; k < rowNnz; ++k)
+            {
+                const int column = i + static_cast<int>(offsets[k]);
+                const double value = m_values[begin + k];
+                Y[i] += value * X[column];
+                Y[column] += value * X[i];
+            }
+            narrowIndex += rowNnz;
+        };
+        const auto multiplyWideRow = [&](int i)
+        {
+            const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+            const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+            const std::size_t rowNnz = end - begin;
+            Y[i] += m_values[begin] * X[i];
+            const int *columns = m_wideColumns.data() + wideIndex;
+            for (std::size_t k = 1; k < rowNnz; ++k)
+            {
+                const int column = columns[k];
+                const double value = m_values[begin + k];
+                Y[i] += value * X[column];
+                Y[column] += value * X[i];
+            }
+            wideIndex += rowNnz;
+        };
+
+        int row = 0;
+        for (const int wideRow : m_wideRowIndices)
+        {
+            for (; row < wideRow; ++row)
+                multiplyNarrowRow(row);
+            multiplyWideRow(row);
+            ++row;
         }
+        for (; row < n; ++row)
+            multiplyNarrowRow(row);
+    }
+    else if (m_useMixedColumnOffsets)
+    {
+        const std::uint16_t escape = std::numeric_limits<std::uint16_t>::max();
+        for (int i = 0; i < n; ++i)
+        {
+            const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+            const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+            std::size_t wide = mixedWideRowOffset(i);
+            Y[i] += m_values[begin] * X[i];
+            for (std::size_t j = begin + 1; j < end; ++j)
+            {
+                const std::uint16_t offset = m_columnOffsets16[j];
+                const int column = offset == escape
+                    ? m_wideColumns[wide++]
+                    : i + static_cast<int>(offset);
+                const double value = m_values[j];
+                Y[i] += value * X[column];
+                Y[column] += value * X[i];
+            }
+        }
+    }
+    else
+    {
+        for(int i=0; i<n; i++)
+        {
+            const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+            const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+            Y[i] += m_values[begin] * X[i];
+            for(std::size_t j = begin + 1; j < end; ++j)
+            {
+                const int column = m_columns[j];
+                const double value = m_values[j];
+                Y[i] += value * X[column];
+                Y[column] += value * X[i];
+            }
+        }
+    }
+    if (m_collectStats)
+    {
+        ++m_spmvCalls;
+        m_spmvSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
     }
 }
 
 double CBigLinProb::Dot(const double *X, const double *Y)
 {
+    const auto started = m_collectStats
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     double z=0.;
 
     for(int i=0; i<n; i++) z+=X[i]*Y[i];
 
+    if (m_collectStats)
+    {
+        ++m_dotCalls;
+        m_dotSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+    }
     return z;
 }
 
 void CBigLinProb::MultPC(const double *X, double *Y)
 {
     rebuildCompactRows();
+    const auto started = m_collectStats
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
 
     if (m_useJacobi)
     {
         for (int i = 0; i < n; ++i)
             Y[i] = X[i] / m_values[m_rowOffsets[static_cast<std::size_t>(i)]];
+        if (m_collectStats)
+        {
+            ++m_preconditionerCalls;
+            m_preconditionerSeconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+        }
         return;
     }
 
     const double c = Lambda*(2.-Lambda);
     for(int i=0; i<n; i++) Y[i]=X[i]*c;
 
-    // invert Lower Triangle;
-    for(int i=0; i<n; i++)
+    if (m_useRowColumnOffsets)
     {
-        const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
-        const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
-        Y[i] /= m_values[begin];
-        for(std::size_t j = begin + 1; j < end; ++j)
-            Y[m_columns[j]] -= m_values[j] * Y[i] * Lambda;
+        std::size_t narrowIndex = 0;
+        std::size_t wideIndex = 0;
+        // invert Lower Triangle;
+        const auto lowerNarrowRow = [&](int i)
+        {
+            const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+            const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+            const std::size_t rowNnz = end - begin;
+            Y[i] /= m_values[begin];
+            const std::uint16_t *offsets =
+                m_columnOffsets16.data() + narrowIndex;
+            for (std::size_t k = 1; k < rowNnz; ++k)
+            {
+                const int column = i + static_cast<int>(offsets[k]);
+                Y[column] -= m_values[begin + k] * Y[i] * Lambda;
+            }
+            narrowIndex += rowNnz;
+        };
+        const auto lowerWideRow = [&](int i)
+        {
+            const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+            const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+            const std::size_t rowNnz = end - begin;
+            Y[i] /= m_values[begin];
+            const int *columns = m_wideColumns.data() + wideIndex;
+            for (std::size_t k = 1; k < rowNnz; ++k)
+                Y[columns[k]] -= m_values[begin + k] * Y[i] * Lambda;
+            wideIndex += rowNnz;
+        };
+
+        int row = 0;
+        for (const int wideRow : m_wideRowIndices)
+        {
+            for (; row < wideRow; ++row)
+                lowerNarrowRow(row);
+            lowerWideRow(row);
+            ++row;
+        }
+        for (; row < n; ++row)
+            lowerNarrowRow(row);
+
+        for (int i = 0; i < n; ++i)
+            Y[i] *= m_values[m_rowOffsets[static_cast<std::size_t>(i)]];
+
+        // invert Upper Triangle;
+        narrowIndex = m_columnOffsets16.size();
+        wideIndex = m_wideColumns.size();
+        const auto upperNarrowRow = [&](int i)
+        {
+            const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+            const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+            const std::size_t rowNnz = end - begin;
+            narrowIndex -= rowNnz;
+            const std::uint16_t *offsets =
+                m_columnOffsets16.data() + narrowIndex;
+            for (std::size_t k = 1; k < rowNnz; ++k)
+            {
+                const int column = i + static_cast<int>(offsets[k]);
+                Y[i] -= m_values[begin + k] * Y[column] * Lambda;
+            }
+            Y[i] /= m_values[begin];
+        };
+        const auto upperWideRow = [&](int i)
+        {
+            const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+            const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+            const std::size_t rowNnz = end - begin;
+            wideIndex -= rowNnz;
+            const int *columns = m_wideColumns.data() + wideIndex;
+            for (std::size_t k = 1; k < rowNnz; ++k)
+                Y[i] -= m_values[begin + k] * Y[columns[k]] * Lambda;
+            Y[i] /= m_values[begin];
+        };
+
+        row = n - 1;
+        for (auto it = m_wideRowIndices.rbegin();
+             it != m_wideRowIndices.rend(); ++it)
+        {
+            for (; row > *it; --row)
+                upperNarrowRow(row);
+            upperWideRow(row);
+            --row;
+        }
+        for (; row >= 0; --row)
+            upperNarrowRow(row);
     }
-
-    for(int i=0; i<n; i++)
-        Y[i] *= m_values[m_rowOffsets[static_cast<std::size_t>(i)]];
-
-    // invert Upper Triangle
-    for(int i=n-1; i>=0; i--)
+    else if (m_useMixedColumnOffsets)
     {
-        const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
-        const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
-        for(std::size_t j = begin + 1; j < end; ++j)
-            Y[i] -= m_values[j] * Y[m_columns[j]] * Lambda;
-        Y[i] /= m_values[begin];
+        const std::uint16_t escape = std::numeric_limits<std::uint16_t>::max();
+        // invert Lower Triangle;
+        for (int i = 0; i < n; ++i)
+        {
+            const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+            const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+            std::size_t wide = mixedWideRowOffset(i);
+            Y[i] /= m_values[begin];
+            for (std::size_t j = begin + 1; j < end; ++j)
+            {
+                const std::uint16_t offset = m_columnOffsets16[j];
+                const int column = offset == escape
+                    ? m_wideColumns[wide++]
+                    : i + static_cast<int>(offset);
+                Y[column] -= m_values[j] * Y[i] * Lambda;
+            }
+        }
+
+        for (int i = 0; i < n; ++i)
+            Y[i] *= m_values[m_rowOffsets[static_cast<std::size_t>(i)]];
+
+        // invert Upper Triangle
+        for (int i = n - 1; i >= 0; --i)
+        {
+            const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+            const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+            std::size_t wide = mixedWideRowOffset(i);
+            for (std::size_t j = begin + 1; j < end; ++j)
+            {
+                const std::uint16_t offset = m_columnOffsets16[j];
+                const int column = offset == escape
+                    ? m_wideColumns[wide++]
+                    : i + static_cast<int>(offset);
+                Y[i] -= m_values[j] * Y[column] * Lambda;
+            }
+            Y[i] /= m_values[begin];
+        }
+    }
+    else
+    {
+        // invert Lower Triangle;
+        for(int i=0; i<n; i++)
+        {
+            const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+            const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+            Y[i] /= m_values[begin];
+            for(std::size_t j = begin + 1; j < end; ++j)
+                Y[m_columns[j]] -= m_values[j] * Y[i] * Lambda;
+        }
+
+        for(int i=0; i<n; i++)
+            Y[i] *= m_values[m_rowOffsets[static_cast<std::size_t>(i)]];
+
+        // invert Upper Triangle
+        for(int i=n-1; i>=0; i--)
+        {
+            const std::size_t begin = m_rowOffsets[static_cast<std::size_t>(i)];
+            const std::size_t end = m_rowOffsets[static_cast<std::size_t>(i) + 1];
+            for(std::size_t j = begin + 1; j < end; ++j)
+                Y[i] -= m_values[j] * Y[m_columns[j]] * Lambda;
+            Y[i] /= m_values[begin];
+        }
+    }
+    if (m_collectStats)
+    {
+        ++m_preconditionerCalls;
+        m_preconditionerSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
     }
 }
 
@@ -362,15 +867,61 @@ bool CBigLinProb::PCGSolve(int flag)
 //	TheView->m_prog1.SetPos(0);
     printf("Conjugate Gradient Solver\n");
 
+    const auto solveStarted = m_collectStats
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    const unsigned long long spmvCallsBefore = m_spmvCalls;
+    const unsigned long long preconditionerCallsBefore = m_preconditionerCalls;
+    const unsigned long long dotCallsBefore = m_dotCalls;
+    const double spmvSecondsBefore = m_spmvSeconds;
+    const double preconditionerSecondsBefore = m_preconditionerSeconds;
+    const double dotSecondsBefore = m_dotSeconds;
+    const unsigned long long packCallsBefore = m_packCalls;
+    const double packSecondsBefore = m_packSeconds;
+    m_lastIterations = 0;
+    m_lastRelativeResidual = -1.;
+
 #ifdef XFEMM_USE_OPENMP
     if (m_useParallelPcg)
-        return solveParallelPCG(flag);
+    {
+        const bool converged = solveParallelPCG(flag);
+        if (m_collectStats)
+        {
+            const double wallSeconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - solveStarted).count();
+            ++m_solveCount;
+            m_totalIterations += static_cast<unsigned long long>(m_lastIterations);
+            std::fprintf(
+                stderr,
+                "XFEMM_PCG_SOLVE solve=%llu iterations=%d "
+                "relative_residual=%.9g wall_s=%.6f parallel=yes "
+                "pack_s=%.6f pack_calls=%llu\n",
+                m_solveCount - 1, m_lastIterations, m_lastRelativeResidual,
+                wallSeconds, m_packSeconds - packSecondsBefore,
+                m_packCalls - packCallsBefore);
+        }
+        return converged;
+    }
 #endif
 
     // residual with V=0
     MultPC(b,Z);
     res_o=Dot(Z,b);
-    if(res_o==0) return true;
+    if(res_o==0)
+    {
+        m_lastRelativeResidual = 0.;
+        if (m_collectStats)
+        {
+            ++m_solveCount;
+            std::fprintf(stderr,
+                         "XFEMM_PCG_SOLVE solve=%llu iterations=0 "
+                         "relative_residual=0 wall_s=%.6f\n",
+                         m_solveCount - 1,
+                         std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - solveStarted).count());
+        }
+        return true;
+    }
 
     // if flag is false, initialize V with zeros;
     if (flag==0) for(i=0; i<n; i++) V[i]=0;
@@ -387,6 +938,7 @@ bool CBigLinProb::PCGSolve(int flag)
     // do iteration;
     do
     {
+        ++m_lastIterations;
         // step i)
         MultA(P,U);
         pAp=Dot(P,U);
@@ -425,6 +977,35 @@ bool CBigLinProb::PCGSolve(int flag)
 
     }
     while(er>Precision);
+
+    m_lastRelativeResidual = er;
+    if (m_collectStats)
+    {
+        const double wallSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - solveStarted).count();
+        const double spmvSeconds = m_spmvSeconds - spmvSecondsBefore;
+        const double preconditionerSeconds =
+            m_preconditionerSeconds - preconditionerSecondsBefore;
+        const double dotSeconds = m_dotSeconds - dotSecondsBefore;
+        const double packSeconds = m_packSeconds - packSecondsBefore;
+        const double otherSeconds = std::max(
+            0., wallSeconds - packSeconds - spmvSeconds -
+                    preconditionerSeconds - dotSeconds);
+        ++m_solveCount;
+        m_totalIterations += static_cast<unsigned long long>(m_lastIterations);
+        std::fprintf(
+            stderr,
+            "XFEMM_PCG_SOLVE solve=%llu iterations=%d relative_residual=%.9g "
+            "wall_s=%.6f pack_s=%.6f spmv_s=%.6f preconditioner_s=%.6f "
+            "dot_s=%.6f other_s=%.6f pack_calls=%llu spmv_calls=%llu "
+            "preconditioner_calls=%llu dot_calls=%llu\n",
+            m_solveCount - 1, m_lastIterations, m_lastRelativeResidual,
+            wallSeconds, packSeconds, spmvSeconds, preconditionerSeconds,
+            dotSeconds, otherSeconds, m_packCalls - packCallsBefore,
+            m_spmvCalls - spmvCallsBefore,
+            m_preconditionerCalls - preconditionerCallsBefore,
+            m_dotCalls - dotCallsBefore);
+    }
 
     return true;
 }
@@ -544,7 +1125,10 @@ bool CBigLinProb::solveParallelPCG(int flag)
             do
             {
 #pragma omp single
-                pAp = 0.;
+                {
+                    ++m_lastIterations;
+                    pAp = 0.;
+                }
 #pragma omp for schedule(static) reduction(+:pAp)
                 for (int i = 0; i < n; ++i)
                 {
@@ -591,6 +1175,8 @@ bool CBigLinProb::solveParallelPCG(int flag)
             while (er > Precision);
         }
     }
+
+    m_lastRelativeResidual = active ? er : 0.;
 
     return true;
 }

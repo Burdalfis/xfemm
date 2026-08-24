@@ -53,6 +53,8 @@ double Power(double x, int y)
 int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
 {
 
+    lastNewtonIterations = 0;
+
     int i,j,k,w,s;
     double Me[3][3],be[3];      // element matrices;
     double Mx[3][3],My[3][3],Mxy[3][3],Mn[3][3];
@@ -680,7 +682,7 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
                 }
 
             }
-            else
+            if (Iter > 0 || (Iter == 0 && sweepWarmStartUsed))
             {
                 k = meshele[i].blk;
 
@@ -946,7 +948,7 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
         }
 
         femm::SolveOptions opts;
-        opts.warm_start = (Iter > 0);
+        opts.warm_start = (Iter > 0) || (Iter == 0 && sweepWarmStartUsed);
         if (L.solve(opts).converged==false)
         {
             return false;
@@ -1016,6 +1018,8 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
 
     }
     while(LinearFlag==false);
+
+    lastNewtonIterations = Iter;
 
     for(i = 0; i<NumNodes; i++)
     {

@@ -87,6 +87,8 @@ public:
         SolveReport report;
         report.solver = "legacy-pcg";
         report.converged = m_system.PCGSolve(options.warm_start ? 1 : 0);
+        report.iterations = m_system.lastIterations();
+        report.relative_residual = m_system.lastRelativeResidual();
         return report;
     }
 

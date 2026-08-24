@@ -40,6 +40,7 @@
 #include "CSegment.h"
 #include "femmenums.h"
 #include "FemmProblem.h"
+#include "mesh/Meshing.h"
 #include "mesh/SolverMesh.h"
 
 #include <memory>
@@ -146,6 +147,7 @@ public:
 	bool LoadMesh(std::string PathName);
 	int DoNonPeriodicBCTriangulation(std::string PathName);
 	int DoPeriodicBCTriangulation(std::string PathName);
+	femm::mesh::MeshResult generateMesh(std::string PathName, bool periodic);
 	bool HasPeriodicBC();
 
     // pointer to function to call when issuing warning messages

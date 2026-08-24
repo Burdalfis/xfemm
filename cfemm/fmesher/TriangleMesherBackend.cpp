@@ -27,30 +27,23 @@ bool SolverMeshFileWriter::write(const femm::mesh::SolverMesh &m,const femm::Fem
 }
 
 namespace fmesher {
-int FMesher::DoNonPeriodicBCTriangulation(std::string path) {
+femm::mesh::MeshResult FMesher::generateMesh(std::string path, bool periodic) {
     femm::mesh::MeshingOptions options; options.verbose=Verbose;
-    femm::mesh::MeshResult result;
     if (backend == Backend::Tangle) {
         TangleMesherBackend selected;
-        result=selected.mesh(*problem,false,options);
-    } else {
-        TriangleMesherBackend selected; selected.WarnMessage=WarnMessage; selected.TriMessage=TriMessage;
-        selected.writePolyFiles=writePolyFiles; selected.compatibilityPath=path;
-        result=selected.mesh(*problem,false,options);
+        return selected.mesh(*problem,periodic,options);
     }
+    TriangleMesherBackend selected; selected.WarnMessage=WarnMessage; selected.TriMessage=TriMessage;
+    selected.writePolyFiles=writePolyFiles; selected.compatibilityPath=path;
+    return selected.mesh(*problem,periodic,options);
+}
+
+int FMesher::DoNonPeriodicBCTriangulation(std::string path) {
+    femm::mesh::MeshResult result=generateMesh(path,false);
     return result.succeeded() && SolverMeshFileWriter::write(result.mesh,*problem,path,WarnMessage) ? 0 : -1;
 }
 int FMesher::DoPeriodicBCTriangulation(std::string path) {
-    femm::mesh::MeshingOptions options; options.verbose=Verbose;
-    femm::mesh::MeshResult result;
-    if (backend == Backend::Tangle) {
-        TangleMesherBackend selected;
-        result=selected.mesh(*problem,true,options);
-    } else {
-        TriangleMesherBackend selected; selected.WarnMessage=WarnMessage; selected.TriMessage=TriMessage;
-        selected.writePolyFiles=writePolyFiles; selected.compatibilityPath=path;
-        result=selected.mesh(*problem,true,options);
-    }
+    femm::mesh::MeshResult result=generateMesh(path,true);
     return result.succeeded() && SolverMeshFileWriter::write(result.mesh,*problem,path,WarnMessage) ? 0 : -1;
 }
 }
