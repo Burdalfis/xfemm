@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/alex/xfemm_cuda/xfemm/build-cudss-session/_deps/tangle_upstream-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

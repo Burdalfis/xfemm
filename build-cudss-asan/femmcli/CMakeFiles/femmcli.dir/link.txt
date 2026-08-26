@@ -1,0 +1,2 @@
+/usr/bin/ar qc libfemmcli.a CMakeFiles/femmcli.dir/FemmState.cpp.o CMakeFiles/femmcli.dir/LuaBaseCommands.cpp.o CMakeFiles/femmcli.dir/LuaCommonCommands.cpp.o CMakeFiles/femmcli.dir/LuaElectrostaticsCommands.cpp.o CMakeFiles/femmcli.dir/LuaHeatflowCommands.cpp.o CMakeFiles/femmcli.dir/LuaMagneticsCommands.cpp.o
+/usr/bin/ranlib libfemmcli.a

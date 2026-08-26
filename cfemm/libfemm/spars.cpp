@@ -23,12 +23,15 @@
 #include "spars.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 #ifdef XFEMM_USE_OPENMP
@@ -38,6 +41,34 @@
 using std::swap;
 
 #define KLUDGE
+
+namespace {
+
+std::atomic<unsigned long long> nextLinearSystemExport{0};
+
+template <typename T>
+bool writeBinary(FILE *stream, const T &value)
+{
+    return std::fwrite(&value, sizeof(value), 1, stream) == 1;
+}
+
+template <typename T>
+bool writeBinaryArray(FILE *stream, const T *values, std::size_t count)
+{
+    return count == 0 || std::fwrite(values, sizeof(T), count, stream) == count;
+}
+
+void hashBytes(std::uint64_t &hash, const void *data, std::size_t bytes)
+{
+    const unsigned char *input = static_cast<const unsigned char *>(data);
+    for (std::size_t i = 0; i < bytes; ++i)
+    {
+        hash ^= input[i];
+        hash *= 1099511628211ull;
+    }
+}
+
+} // namespace
 
 
 CEntry::CEntry()
@@ -544,6 +575,161 @@ void CBigLinProb::rebuildCompactRows()
     }
 }
 
+void CBigLinProb::copyUpperCsr(std::vector<std::int32_t> &rowOffsets,
+                               std::vector<std::int32_t> &columnIndices,
+                               std::vector<double> &values)
+{
+    rebuildCompactRows();
+    if (m_rowOffsets.back() >
+        static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))
+        throw std::overflow_error("real sparse matrix has more than INT32_MAX stored entries");
+
+    rowOffsets.resize(m_rowOffsets.size());
+    std::transform(m_rowOffsets.begin(), m_rowOffsets.end(), rowOffsets.begin(),
+                   [](std::size_t offset) {
+                       return static_cast<std::int32_t>(offset);
+                   });
+    columnIndices.assign(m_columns.begin(), m_columns.end());
+    values = m_values;
+}
+
+void CBigLinProb::writeLinearSystemExport(
+    const std::string &prefix, unsigned long long exportIndex, bool warmStart,
+    const std::vector<double> &initialSolution, bool byTopology)
+{
+    // The development format is deliberately simple and fixed-width.  It is
+    // documented alongside the standalone CUDA benchmark reader.
+    rebuildCompactRows();
+
+    const std::vector<std::size_t> *rowOffsets = &m_symmetricRowOffsets;
+    const std::vector<int> *columns = &m_symmetricColumns;
+    const std::vector<double> *values = &m_symmetricValues;
+    std::vector<std::size_t> fullRowOffsets;
+    std::vector<int> fullColumns;
+    std::vector<double> fullValues;
+
+    if (rowOffsets->empty())
+    {
+        fullRowOffsets.assign(static_cast<std::size_t>(n) + 1, 0);
+        for (int row = 0; row < n; ++row)
+        {
+            for (CEntry *entry = M[row]; entry != nullptr; entry = entry->next)
+            {
+                ++fullRowOffsets[static_cast<std::size_t>(row) + 1];
+                if (entry->c != row)
+                    ++fullRowOffsets[static_cast<std::size_t>(entry->c) + 1];
+            }
+        }
+        for (int row = 0; row < n; ++row)
+            fullRowOffsets[static_cast<std::size_t>(row) + 1] +=
+                fullRowOffsets[static_cast<std::size_t>(row)];
+
+        fullColumns.resize(fullRowOffsets.back());
+        fullValues.resize(fullRowOffsets.back());
+        std::vector<std::size_t> next = fullRowOffsets;
+        for (int row = 0; row < n; ++row)
+        {
+            for (CEntry *entry = M[row]; entry != nullptr; entry = entry->next)
+            {
+                const int column = entry->c;
+                std::size_t destination = next[static_cast<std::size_t>(row)]++;
+                fullColumns[destination] = column;
+                fullValues[destination] = entry->x;
+                if (column != row)
+                {
+                    destination = next[static_cast<std::size_t>(column)]++;
+                    fullColumns[destination] = row;
+                    fullValues[destination] = entry->x;
+                }
+            }
+        }
+        rowOffsets = &fullRowOffsets;
+        columns = &fullColumns;
+        values = &fullValues;
+    }
+
+    std::vector<std::uint64_t> offsets64(rowOffsets->size());
+    std::transform(rowOffsets->begin(), rowOffsets->end(), offsets64.begin(),
+                   [](std::size_t offset) {
+                       return static_cast<std::uint64_t>(offset);
+                   });
+    std::uint64_t topologyHash = 1469598103934665603ull;
+    hashBytes(topologyHash, offsets64.data(),
+              offsets64.size() * sizeof(offsets64[0]));
+    hashBytes(topologyHash, columns->data(),
+              columns->size() * sizeof((*columns)[0]));
+
+    char suffix[64];
+    if (byTopology)
+        std::snprintf(suffix, sizeof(suffix), ".%016llx.xfemm-system",
+                      static_cast<unsigned long long>(topologyHash));
+    else
+        std::snprintf(suffix, sizeof(suffix), ".%06llu.xfemm-system",
+                      exportIndex);
+    const std::string path = prefix + suffix;
+    // The indexed temporary name also keeps concurrent same-topology exports
+    // from sharing an intermediate file; rename still publishes atomically.
+    const std::string temporaryPath =
+        path + "." + std::to_string(exportIndex) + ".tmp";
+    FILE *stream = std::fopen(temporaryPath.c_str(), "wb");
+    if (stream == nullptr)
+    {
+        std::fprintf(stderr, "XFEMM_SYSTEM_EXPORT error=open path=%s\n",
+                     temporaryPath.c_str());
+        return;
+    }
+
+    const char magic[8] = {'X', 'F', 'E', 'M', 'M', 'L', 'S', '\0'};
+    const std::uint32_t version = 1;
+    const std::uint32_t endianMarker = 0x01020304u;
+    const std::uint32_t scalarBytes = sizeof(double);
+    const std::uint32_t columnIndexBytes = sizeof(std::int32_t);
+    const std::uint64_t dimension = static_cast<std::uint64_t>(n);
+    const std::uint64_t nonzeros = static_cast<std::uint64_t>(values->size());
+    const std::uint64_t solveIndex = exportIndex;
+    const std::uint32_t flags = (warmStart ? 1u : 0u) | 2u; // full symmetric CSR
+    const std::uint32_t parallelThreads =
+        static_cast<std::uint32_t>(m_parallelThreads);
+    const std::int64_t iterations = static_cast<std::int64_t>(m_lastIterations);
+
+    bool ok = writeBinaryArray(stream, magic, sizeof(magic)) &&
+              writeBinary(stream, version) && writeBinary(stream, endianMarker) &&
+              writeBinary(stream, scalarBytes) &&
+              writeBinary(stream, columnIndexBytes) &&
+              writeBinary(stream, dimension) && writeBinary(stream, nonzeros) &&
+              writeBinary(stream, solveIndex) && writeBinary(stream, flags) &&
+              writeBinary(stream, parallelThreads) &&
+              writeBinary(stream, Precision) && writeBinary(stream, Lambda) &&
+              writeBinary(stream, iterations) &&
+              writeBinary(stream, m_lastRelativeResidual);
+
+    ok = ok && writeBinaryArray(stream, offsets64.data(), offsets64.size());
+    ok = ok && writeBinaryArray(stream, columns->data(), columns->size());
+    ok = ok && writeBinaryArray(stream, values->data(), values->size());
+    ok = ok && writeBinaryArray(stream, b, static_cast<std::size_t>(n));
+    ok = ok && writeBinaryArray(stream, initialSolution.data(),
+                                initialSolution.size());
+    ok = ok && writeBinaryArray(stream, V, static_cast<std::size_t>(n));
+    const bool closeOk = std::fclose(stream) == 0;
+    ok = ok && closeOk;
+
+    if (!ok || std::rename(temporaryPath.c_str(), path.c_str()) != 0)
+    {
+        std::remove(temporaryPath.c_str());
+        std::fprintf(stderr, "XFEMM_SYSTEM_EXPORT error=write path=%s\n",
+                     path.c_str());
+        return;
+    }
+    std::fprintf(stderr,
+                 "XFEMM_SYSTEM_EXPORT path=%s n=%d nnz=%zu solve=%llu "
+                 "warm_start=%s iterations=%d relative_residual=%.9g "
+                 "topology_hash=%016llx\n",
+                 path.c_str(), n, values->size(), exportIndex,
+                 warmStart ? "yes" : "no", m_lastIterations,
+                 m_lastRelativeResidual,
+                 static_cast<unsigned long long>(topologyHash));
+}
+
 void CBigLinProb::MultA(const double *X, double *Y)
 {
     rebuildCompactRows();
@@ -881,6 +1067,24 @@ bool CBigLinProb::PCGSolve(int flag)
     m_lastIterations = 0;
     m_lastRelativeResidual = -1.;
 
+    const char *topologyExportEnvironment =
+        std::getenv("XFEMM_LINEAR_SYSTEM_EXPORT_BY_TOPOLOGY");
+    const bool exportByTopology = topologyExportEnvironment != nullptr &&
+                                  topologyExportEnvironment[0] != '\0';
+    const char *exportPrefixEnvironment = exportByTopology
+        ? topologyExportEnvironment
+        : std::getenv("XFEMM_LINEAR_SYSTEM_EXPORT");
+    const bool exportEnabled = exportPrefixEnvironment != nullptr &&
+                               exportPrefixEnvironment[0] != '\0';
+    const std::string exportPrefix =
+        exportEnabled ? exportPrefixEnvironment : std::string();
+    const unsigned long long exportIndex = exportEnabled
+        ? nextLinearSystemExport.fetch_add(1, std::memory_order_relaxed)
+        : 0;
+    std::vector<double> initialSolution;
+    if (exportEnabled)
+        initialSolution.assign(V, V + n);
+
 #ifdef XFEMM_USE_OPENMP
     if (m_useParallelPcg)
     {
@@ -900,6 +1104,9 @@ bool CBigLinProb::PCGSolve(int flag)
                 wallSeconds, m_packSeconds - packSecondsBefore,
                 m_packCalls - packCallsBefore);
         }
+        if (exportEnabled)
+            writeLinearSystemExport(exportPrefix, exportIndex, flag != 0,
+                                    initialSolution, exportByTopology);
         return converged;
     }
 #endif
@@ -920,6 +1127,9 @@ bool CBigLinProb::PCGSolve(int flag)
                          std::chrono::duration<double>(
                              std::chrono::steady_clock::now() - solveStarted).count());
         }
+        if (exportEnabled)
+            writeLinearSystemExport(exportPrefix, exportIndex, flag != 0,
+                                    initialSolution, exportByTopology);
         return true;
     }
 
@@ -1006,6 +1216,10 @@ bool CBigLinProb::PCGSolve(int flag)
             m_preconditionerCalls - preconditionerCallsBefore,
             m_dotCalls - dotCallsBefore);
     }
+
+    if (exportEnabled)
+        writeLinearSystemExport(exportPrefix, exportIndex, flag != 0,
+                                initialSolution, exportByTopology);
 
     return true;
 }

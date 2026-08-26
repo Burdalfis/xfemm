@@ -35,6 +35,8 @@ class ModelDefinition {
 public:
     /** Transfers exclusive ownership so no caller can bypass session dirty tracking. */
     explicit ModelDefinition(std::unique_ptr<FemmProblem> problem);
+    /** Accepts a parser-owned model after parsing; callers must relinquish their copy. */
+    explicit ModelDefinition(std::shared_ptr<FemmProblem> problem);
     const FemmProblem &problem() const { return *m_problem; }
 
     CircuitId circuit(const std::string &name) const;
@@ -43,7 +45,7 @@ public:
 
 private:
     friend class AnalysisSession;
-    std::unique_ptr<FemmProblem> m_problem;
+    std::shared_ptr<FemmProblem> m_problem;
 };
 
 enum class CircuitConstraintKind {
@@ -68,6 +70,8 @@ struct AcceptedState {
     std::uint64_t parameterRevision = 0;
     double time = 0;
     std::string backendState;
+    /** Portable real field state; native backends may also retain faster private state. */
+    std::shared_ptr<const std::vector<double>> realNodalState;
 };
 
 /** Inputs which may change between evaluations without changing the physical model. */
@@ -152,10 +156,71 @@ struct RealCircuitPortResult {
     std::optional<double> terminalVoltage;
 };
 
+struct RealAirGapHarmonic {
+    int order = 0;
+    CComplex radialCos;
+    CComplex radialSin;
+    CComplex tangentialCos;
+    CComplex tangentialSin;
+};
+
+struct RealAirGapResult {
+    std::string name;
+    double torque = 0;
+    CComplex centerVectorPotential;
+    std::vector<RealAirGapHarmonic> harmonics;
+};
+
+/** Programmatically accessible timing and lifecycle data for one evaluate. */
+struct EvaluationDiagnostics {
+    double sessionInitializationMs = 0;
+    double sessionSynchronizationMs = 0;
+    double modelPreparationMs = 0;
+    double bucketLookupMs = 0;
+    double bucketSwitchMs = 0;
+    double bucketDefinitionConstructionMs = 0;
+    double bucketConstructionMs = 0;
+    double symbolicAnalysisMs = 0;
+    double airGapUpdateMs = 0;
+    double nonlinearMaterialEvaluationMs = 0;
+    double numericMatrixAssemblyMs = 0;
+    double sparsePackingMs = 0;
+    double hostToDeviceMs = 0;
+    double numericFactorizationMs = 0;
+    double linearSolveMs = 0;
+    double deviceToHostMs = 0;
+    double residualEvaluationMs = 0;
+    double nonlinearBookkeepingMs = 0;
+    double resultPackagingMs = 0;
+    double fluxLinkageMs = 0;
+    double torqueMs = 0;
+    double serializationPostprocessorMs = 0;
+    double totalEvaluateMs = 0;
+    std::uint64_t matrixNonzeros = 0;
+    std::uint64_t factorNonzeros = 0;
+    std::uint64_t permanentDeviceBytes = 0;
+    std::uint64_t peakDeviceBytes = 0;
+    std::uint64_t hostToDeviceBytes = 0;
+    int nonlinearIterations = 0;
+    double relativeResidual = -1;
+    std::string linearSolver;
+    std::string bucketIdentity;
+    bool converged = false;
+    bool symbolicReused = false;
+    bool bucketReused = false;
+    bool nonlinearWarmStartUsed = false;
+    bool factorizationRetained = false;
+    bool exactTopologyFallback = false;
+    bool legacyFallback = false;
+    bool deterministic = false;
+};
+
 /** Strongly typed result payload for magnetostatic analyses. */
 struct RealTrialSolution {
     RealNodalSolution nodal;
     std::vector<RealCircuitPortResult> circuits;
+    std::vector<RealAirGapResult> airGaps;
+    double torque = 0;
 };
 
 struct TrialSolution {
@@ -167,6 +232,7 @@ struct TrialSolution {
     std::vector<CircuitPortResult> circuits;
     std::optional<RealTrialSolution> real;
     std::string backendState;
+    EvaluationDiagnostics diagnostics;
 };
 
 /** Adapter implemented by a concrete field solver; it never receives mutable model state. */
@@ -182,6 +248,12 @@ public:
     virtual TrialSolution solve(const ModelDefinition &model,
                                 const SolveParameters &parameters,
                                 const PreparedAnalysis &prepared) = 0;
+    /** Optional expensive resource preparation performed outside evaluate(). */
+    virtual void initialize(const ModelDefinition &, const SolveParameters &,
+                            const PreparedAnalysis &) {}
+    /** Promote/revert native nonlinear state without rebuilding solver resources. */
+    virtual void commitTrial(const TrialSolution &) {}
+    virtual void rollbackToCommitted() {}
 };
 
 } // namespace femm
@@ -228,8 +300,12 @@ public:
     void updateSolveParameters(const std::function<void(SolveParameters &)> &update);
 
     void synchronize();
+    /** Prepare persistent backend resources for the current operating bucket. */
+    void initialize();
     TrialSolution solve();
     std::shared_ptr<const AcceptedState> acceptSolution(const TrialSolution &solution);
+    /** Restore the committed magnetic field while retaining mesh/CUDA/bucket state. */
+    void rollbackToCommitted();
 
 private:
     void requireCircuit(CircuitId id) const;

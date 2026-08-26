@@ -10,6 +10,7 @@
 
 #include <cmath>
 #include <atomic>
+#include <chrono>
 #include <stdexcept>
 
 namespace femm {
@@ -65,6 +66,15 @@ bool sameAirGaps(const std::map<AirGapId, AirGapPosition> &lhs,
     return true;
 }
 
+double canonicalAngle(double angle)
+{
+    double canonical = std::fmod(angle, 360.0);
+    if (canonical < 0) canonical += 360.0;
+    // Treat a rounded full revolution as zero so bucket lookup is stable.
+    if (canonical == 360.0) canonical = 0.0;
+    return canonical;
+}
+
 template<typename T>
 const T &as(const MaterialPropertyValue &value, const char *description)
 {
@@ -87,6 +97,10 @@ Dirty operator&(Dirty lhs, Dirty rhs)
 }
 
 ModelDefinition::ModelDefinition(std::unique_ptr<FemmProblem> problem)
+    : ModelDefinition(std::shared_ptr<FemmProblem>(std::move(problem)))
+{}
+
+ModelDefinition::ModelDefinition(std::shared_ptr<FemmProblem> problem)
     : m_problem(std::move(problem))
 {
     if (!m_problem || m_problem->filetype != FileType::MagneticsFile)
@@ -143,7 +157,8 @@ AnalysisSession::AnalysisSession(ModelDefinition model, std::shared_ptr<Analysis
     for (std::size_t i = 0; i < m_model.problem().lineproplist.size(); ++i) {
         const auto *boundary = dynamic_cast<const CMBoundaryProp *>(m_model.problem().lineproplist[i].get());
         if (boundary && (boundary->BdryFormat == 6 || boundary->BdryFormat == 7))
-            m_parameters.airGapPositions[{i}] = {boundary->InnerAngle, boundary->OuterAngle};
+            m_parameters.airGapPositions[{i}] = {canonicalAngle(boundary->InnerAngle),
+                                                  canonicalAngle(boundary->OuterAngle)};
     }
 }
 
@@ -261,7 +276,7 @@ void AnalysisSession::setAirGapAngle(AirGapId id, double inner, double outer)
     requireAirGap(id);
     if (!std::isfinite(inner) || !std::isfinite(outer))
         throw std::invalid_argument("air-gap angles must be finite");
-    m_parameters.airGapPositions[id] = {inner, outer};
+    m_parameters.airGapPositions[id] = {canonicalAngle(inner), canonicalAngle(outer)};
     ++m_parameterRevision;
     invalidate(Dirty::AirGapCoupling | Dirty::Operator);
 }
@@ -339,6 +354,10 @@ void AnalysisSession::updateSolveParameters(const std::function<void(SolveParame
         if (!std::isfinite(entry.second.innerAngle) || !std::isfinite(entry.second.outerAngle))
             throw std::invalid_argument("air-gap angles must be finite");
     }
+    for (auto &entry : candidate.airGapPositions) {
+        entry.second.innerAngle = canonicalAngle(entry.second.innerAngle);
+        entry.second.outerAngle = canonicalAngle(entry.second.outerAngle);
+    }
     if (candidate.initialState && candidate.initialState->modelRevision != m_modelRevision)
         throw std::invalid_argument("initial solution belongs to another model revision");
 
@@ -412,15 +431,28 @@ void AnalysisSession::synchronize()
 
 TrialSolution AnalysisSession::solve()
 {
+    const auto evaluateStarted = std::chrono::steady_clock::now();
+    const auto synchronizeStarted = std::chrono::steady_clock::now();
     synchronize();
+    const double synchronizationMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - synchronizeStarted).count();
     TrialSolution result = m_backend->solve(m_model, m_parameters, m_prepared);
     result.id = m_nextSolutionId++;
     result.sessionId = m_sessionId;
     result.modelRevision = m_modelRevision;
     result.parameterRevision = m_parameterRevision;
     result.time = m_parameters.time;
+    result.diagnostics.sessionSynchronizationMs = synchronizationMs;
+    result.diagnostics.totalEvaluateMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - evaluateStarted).count();
     m_dirty = Dirty::None;
     return result;
+}
+
+void AnalysisSession::initialize()
+{
+    synchronize();
+    m_backend->initialize(m_model, m_parameters, m_prepared);
 }
 
 std::shared_ptr<const AcceptedState> AnalysisSession::acceptSolution(const TrialSolution &solution)
@@ -428,14 +460,26 @@ std::shared_ptr<const AcceptedState> AnalysisSession::acceptSolution(const Trial
     if (solution.sessionId != m_sessionId || solution.modelRevision != m_modelRevision ||
         solution.parameterRevision != m_parameterRevision || solution.id == 0)
         throw std::invalid_argument("trial solution is stale or does not belong to this session");
+    m_backend->commitTrial(solution);
+    std::shared_ptr<const std::vector<double>> portableState;
+    if (solution.real)
+        portableState = std::make_shared<const std::vector<double>>(
+            solution.real->nodal.magneticVectorPotential);
     auto accepted = std::make_shared<AcceptedState>(AcceptedState{solution.modelRevision,
                                                                   solution.parameterRevision,
                                                                   solution.time,
-                                                                  solution.backendState});
+                                                                  solution.backendState,
+                                                                  std::move(portableState)});
     m_parameters.initialState = accepted;
     ++m_parameterRevision;
     invalidate(Dirty::InitialState);
     return accepted;
+}
+
+void AnalysisSession::rollbackToCommitted()
+{
+    m_backend->rollbackToCommitted();
+    invalidate(Dirty::InitialState);
 }
 
 } // namespace femm

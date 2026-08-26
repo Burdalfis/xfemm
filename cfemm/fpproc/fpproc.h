@@ -288,8 +288,15 @@ public:
     /** Load a solved static magnetic analysis without serializing an .ans file. */
     bool OpenDocument(const femm::FemmProblem &problem, const FSolver &solver,
                       const femm::LinearSystemBackend<double> &solution);
+    /**
+     * Refresh only state-dependent fields in an already initialized
+     * in-memory view. Mesh connectivity, Lua magnetization setup and spatial
+     * acceleration data remain persistent.
+     */
+    bool UpdateSolution(const FSolver &solver,
+                        const femm::LinearSystemBackend<double> &solution);
     /** Prepare derived post-processing state after an in-memory solution import. */
-    bool finalizeSolution();
+    bool finalizeSolution(bool initializeTopology = true);
     /** Freeze the currently loaded solution (selection and contour state are excluded). */
     MagneticSolutionSnapshot solutionSnapshot() const;
     bool MakeMask();

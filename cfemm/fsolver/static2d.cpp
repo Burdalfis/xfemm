@@ -32,6 +32,7 @@
 #include <malloc.h>
 #include <string>
 #include <cstdio>
+#include <chrono>
 
 #include <csignal>
 
@@ -54,6 +55,7 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
 {
 
     lastNewtonIterations = 0;
+    lastStaticSolveTimings = {};
 
     int i,j,k,w,s;
     double Me[3][3],be[3];      // element matrices;
@@ -178,6 +180,9 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
 
     do
     {
+        const auto assemblyStarted = std::chrono::steady_clock::now();
+        const double materialBefore =
+            lastStaticSolveTimings.nonlinearMaterialEvaluationMs;
 
 //	TheView->SetDlgItemText(IDC_FRAME1,"Matrix Construction");
 //	TheView->m_prog1.SetPos(0);
@@ -601,6 +606,8 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
 
 //////// Nonlinear Part
 
+            const auto materialStarted = std::chrono::steady_clock::now();
+
             // update permeability for the element;
             if (Iter==0)
             {
@@ -797,6 +804,9 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
                     }
                 }
             }
+            lastStaticSolveTimings.nonlinearMaterialEvaluationMs +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - materialStarted).count();
 
             // combine block matrices into global matrices;
             for (j = 0; j<3; j++)
@@ -949,10 +959,19 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
 
         femm::SolveOptions opts;
         opts.warm_start = (Iter > 0) || (Iter == 0 && sweepWarmStartUsed);
+        const double assemblyElapsed =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - assemblyStarted).count();
+        const double materialElapsed =
+            lastStaticSolveTimings.nonlinearMaterialEvaluationMs - materialBefore;
+        lastStaticSolveTimings.numericMatrixAssemblyMs +=
+            assemblyElapsed > materialElapsed ? assemblyElapsed - materialElapsed : 0.0;
         if (L.solve(opts).converged==false)
         {
             return false;
         }
+
+        const auto bookkeepingStarted = std::chrono::steady_clock::now();
 
         if (LinearFlag==false)
         {
@@ -1013,6 +1032,10 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
         {
             LinearFlag = true;
         }
+
+        lastStaticSolveTimings.nonlinearBookkeepingMs +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - bookkeepingStarted).count();
 
         Iter++;
 

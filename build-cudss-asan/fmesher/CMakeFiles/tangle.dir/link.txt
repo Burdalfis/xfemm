@@ -1,0 +1,2 @@
+/usr/bin/ar qc libtangle.a "CMakeFiles/tangle.dir/home/alex/xfemm_cuda/xfemm/build-cuda-feasibility/_deps/tangle_upstream-src/tangle.cpp.o" "CMakeFiles/tangle.dir/home/alex/xfemm_cuda/xfemm/build-cuda-feasibility/_deps/tangle_upstream-src/float256.cpp.o"
+/usr/bin/ranlib libtangle.a

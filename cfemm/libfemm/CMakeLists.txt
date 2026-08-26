@@ -115,6 +115,32 @@ if(XFEMM_ENABLE_OPENMP)
 endif()
 
 # ---------------------------------------------------------------------------
+# Optional native-real FP64 cuDSS backend. This is deliberately opt-in; the
+# legacy CPU backend remains the default and reference implementation.
+# ---------------------------------------------------------------------------
+option(XFEMM_USE_CUDSS "Build the persistent native-real cuDSS backend" OFF)
+if(XFEMM_USE_CUDSS)
+    find_package(CUDAToolkit REQUIRED)
+    set(CUDSS_ROOT "" CACHE PATH "Optional cuDSS installation prefix")
+    find_path(CUDSS_INCLUDE_DIR cudss.h HINTS "${CUDSS_ROOT}"
+        PATHS /usr/include/libcudss/13
+        PATH_SUFFIXES include include/libcudss/13)
+    find_library(CUDSS_LIBRARY NAMES cudss libcudss.so.0
+        HINTS "${CUDSS_ROOT}"
+        PATHS /usr/lib/x86_64-linux-gnu/libcudss/13
+        PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu/libcudss/13)
+    if(NOT CUDSS_INCLUDE_DIR OR NOT CUDSS_LIBRARY)
+        message(FATAL_ERROR
+            "XFEMM_USE_CUDSS was requested but cuDSS was not found. Set CUDSS_ROOT or install libcudss-dev.")
+    endif()
+    target_sources(femm PRIVATE linsolve/CudssLinearSystemBackend.cpp)
+    target_include_directories(femm PRIVATE ${CUDSS_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
+    target_compile_definitions(femm PUBLIC XFEMM_USE_CUDSS)
+    target_link_libraries(femm PUBLIC CUDA::cudart ${CUDSS_LIBRARY})
+    message(STATUS "Persistent cuDSS backend enabled: ${CUDSS_LIBRARY}")
+endif()
+
+# ---------------------------------------------------------------------------
 # Optional PETSc linear solver backend
 # ---------------------------------------------------------------------------
 option(XFEMM_USE_PETSc "Use the PETSc linear solver backend" OFF)

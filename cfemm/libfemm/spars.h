@@ -24,6 +24,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 class CEntry
@@ -82,6 +83,17 @@ public:
     int lastIterations() const { return m_lastIterations; }
     double lastRelativeResidual() const { return m_lastRelativeResidual; }
 
+    /**
+     * Copy the assembled symmetric matrix's stored upper triangle into
+     * conventional zero-based CSR.  This is intentionally a read-only bridge
+     * from FEMM's linked-list assembly representation to native sparse
+     * libraries.  Explicitly assembled zero entries are retained because
+     * they are part of a persistent solver's immutable sparsity graph.
+     */
+    void copyUpperCsr(std::vector<std::int32_t> &rowOffsets,
+                      std::vector<std::int32_t> &columnIndices,
+                      std::vector<double> &values);
+
 //		CFknDlg *TheView;
 
 private:
@@ -92,6 +104,11 @@ private:
      * individually allocated entries on every pass.
      */
     void rebuildCompactRows();
+    void writeLinearSystemExport(const std::string &prefix,
+                                 unsigned long long exportIndex,
+                                 bool warmStart,
+                                 const std::vector<double> &initialSolution,
+                                 bool byTopology);
     bool solveParallelPCG(int flag);
     void applyParallelPreconditionerChunk(const double *X, double *Y,
                                           int begin, int end);

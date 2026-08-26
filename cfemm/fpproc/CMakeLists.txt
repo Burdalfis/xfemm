@@ -5,6 +5,7 @@ add_library(fpproc STATIC
     CPostProcMElement.cpp
     MagneticSolutionSnapshot.cpp
     InMemorySolution.cpp
+    PersistentMotorSession.cpp
     )
 target_include_directories(fpproc PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}> $<INSTALL_INTERFACE:include>)
 target_link_libraries(fpproc PUBLIC femm fsolver)
@@ -28,6 +29,21 @@ add_test(NAME fpproc_snapshot_age_parity
 set_tests_properties(fpproc_snapshot_age_parity PROPERTIES
     DEPENDS femmcli_antiperiodicBC_AGE_TorqueBenchmark.lua
     LABELS "magnetics;postprocessor;unit;airgap")
+
+if(XFEMM_USE_CUDSS)
+    add_executable(persistent_motor_session_test
+        test/persistent_motor_session_test.cpp)
+    target_link_libraries(persistent_motor_session_test PRIVATE fpproc)
+    add_executable(persistent_motor_session_benchmark
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../benchmarks/cuda/persistent_motor_session_benchmark.cpp)
+    target_link_libraries(persistent_motor_session_benchmark PRIVATE fpproc)
+    add_test(NAME persistent_motor_session_cudss
+        COMMAND persistent_motor_session_test
+                ${CMAKE_SOURCE_DIR}/../mfemm/testing/radial_machine/data/radial_machine_sliding.fem)
+    set_tests_properties(persistent_motor_session_cudss PROPERTIES
+        SKIP_RETURN_CODE 77
+        LABELS "magnetics;cuda;cudss;airgap;regression")
+endif()
 install(
     TARGETS fpproc-test
     RUNTIME DESTINATION bin

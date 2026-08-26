@@ -61,6 +61,13 @@ class FSolver : public FEASolver<
 // Attributes
 public:
 
+    struct StaticSolveTimings
+    {
+        double nonlinearMaterialEvaluationMs = 0;
+        double numericMatrixAssemblyMs = 0;
+        double nonlinearBookkeepingMs = 0;
+    };
+
     struct SweepWarmStartState
     {
         std::vector<femm::CNode> nodes;
@@ -135,6 +142,9 @@ public:
     bool usedSweepWarmStart() const { return sweepWarmStartUsed; }
     bool remappedSweepWarmStart() const { return sweepWarmStartRemapped; }
     int newtonIterations() const { return lastNewtonIterations; }
+    const StaticSolveTimings &staticSolveTimings() const { return lastStaticSolveTimings; }
+    /** Session-only seed marker; direct solvers ignore it as a linear initial guess. */
+    void setSessionWarmStartUsed(bool used) { sweepWarmStartUsed = used; }
 
 private:
 
@@ -180,6 +190,7 @@ private:
     bool sweepWarmStartUsed = false;
     bool sweepWarmStartRemapped = false;
     int lastNewtonIterations = 0;
+    StaticSolveTimings lastStaticSolveTimings;
 };
 
 /////////////////////////////////////////////////////////////////////////////

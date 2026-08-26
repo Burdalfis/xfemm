@@ -1,0 +1,2 @@
+/usr/bin/ar qc libepproc.a CMakeFiles/epproc.dir/epproc.cpp.o CMakeFiles/epproc.dir/CSPointVals.cpp.o
+/usr/bin/ranlib libepproc.a

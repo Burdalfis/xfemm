@@ -497,7 +497,12 @@ LoadMeshErr FSolver::LoadMesh(const femm::mesh::SolverMesh &mesh)
     NumAirGapElems = static_cast<int>(agelist.size());
 
     int defaultLabel = -1;
-    for (int i=0; i<NumBlockLabels; ++i) if (labellist[i].IsDefault) defaultLabel=i;
+    std::vector<int> regionLabels;
+    regionLabels.reserve(labellist.size());
+    for (int i=0; i<NumBlockLabels; ++i) {
+        if (labellist[i].IsDefault) defaultLabel=i;
+        if (labellist[i].BlockType >= 0) regionLabels.push_back(i);
+    }
     meshele.clear(); meshele.reserve(mesh.elements.size());
     std::vector<std::vector<std::size_t>> adjacent(nodeCount);
     for (std::size_t i=0; i<mesh.elements.size(); ++i) {
@@ -505,7 +510,10 @@ LoadMeshErr FSolver::LoadMesh(const femm::mesh::SolverMesh &mesh)
         for (auto index : source.nodes) if (!validIndex(index,nodeCount)) return BADELEMENTFILE;
         femmsolver::CMElement element;
         for(int n=0;n<3;++n) element.p[n]=static_cast<int>(source.nodes[n]);
-        element.lbl=source.regionAttribute-1; if(element.lbl<0) element.lbl=defaultLabel;
+        const int region = source.regionAttribute - 1;
+        if (region >= static_cast<int>(regionLabels.size())) return ELMLABELTOOBIG;
+        element.lbl = region >= 0
+            ? regionLabels[static_cast<std::size_t>(region)] : defaultLabel;
         if(element.lbl<0) return MISSINGMATPROPS;
         if(element.lbl>=static_cast<int>(labellist.size())) return ELMLABELTOOBIG;
         element.blk=labellist[element.lbl].BlockType;
@@ -908,7 +916,19 @@ void FSolver::GetFillFactor(int lbl)
     // the apparent conductivity and permeability for use in
     // post-processing the voltage.
 
-    CMSolverMaterialProp* bp= &blockproplist[labellist[lbl].BlockType];
+    if (lbl < 0 || lbl >= static_cast<int>(labellist.size()))
+        return;
+    const int blockType = labellist[lbl].BlockType;
+    if (blockType < 0 || blockType >= static_cast<int>(blockproplist.size()))
+    {
+        // Hole/<No Mesh> labels intentionally have no material. They can be
+        // retained by the in-memory session even though no element refers to
+        // them, so there is no fill factor to compute.
+        labellist[lbl].bIsWound = false;
+        labellist[lbl].ProximityMu = 1.;
+        return;
+    }
+    CMSolverMaterialProp* bp= &blockproplist[blockType];
     CMBlockLabel* bl= &labellist[lbl];
     double atot,awire=0,d,o,fill,dd,W,R=0,c1,c2;
     int i,wiretype;

@@ -1,0 +1,29 @@
+
+# Consider dependencies only in project.
+set(CMAKE_DEPENDS_IN_PROJECT_ONLY OFF)
+
+# The set of languages for which implicit dependencies are needed:
+set(CMAKE_DEPENDS_LANGUAGES
+  )
+
+# The set of dependency files which are needed:
+set(CMAKE_DEPENDS_DEPENDENCY_FILES
+  "/home/alex/xfemm_cuda/xfemm/cfemm/fsolver/AnalysisSession.cpp" "fsolver/CMakeFiles/fsolver.dir/AnalysisSession.cpp.o" "gcc" "fsolver/CMakeFiles/fsolver.dir/AnalysisSession.cpp.o.d"
+  "/home/alex/xfemm_cuda/xfemm/cfemm/fsolver/FSolverAnalysisBackend.cpp" "fsolver/CMakeFiles/fsolver.dir/FSolverAnalysisBackend.cpp.o" "gcc" "fsolver/CMakeFiles/fsolver.dir/FSolverAnalysisBackend.cpp.o.d"
+  "/home/alex/xfemm_cuda/xfemm/cfemm/fsolver/fsolver.cpp" "fsolver/CMakeFiles/fsolver.dir/fsolver.cpp.o" "gcc" "fsolver/CMakeFiles/fsolver.dir/fsolver.cpp.o.d"
+  "/home/alex/xfemm_cuda/xfemm/cfemm/fsolver/harmonic2d.cpp" "fsolver/CMakeFiles/fsolver.dir/harmonic2d.cpp.o" "gcc" "fsolver/CMakeFiles/fsolver.dir/harmonic2d.cpp.o.d"
+  "/home/alex/xfemm_cuda/xfemm/cfemm/fsolver/harmonicaxi.cpp" "fsolver/CMakeFiles/fsolver.dir/harmonicaxi.cpp.o" "gcc" "fsolver/CMakeFiles/fsolver.dir/harmonicaxi.cpp.o.d"
+  "/home/alex/xfemm_cuda/xfemm/cfemm/fsolver/static2d.cpp" "fsolver/CMakeFiles/fsolver.dir/static2d.cpp.o" "gcc" "fsolver/CMakeFiles/fsolver.dir/static2d.cpp.o.d"
+  "/home/alex/xfemm_cuda/xfemm/cfemm/fsolver/staticaxi.cpp" "fsolver/CMakeFiles/fsolver.dir/staticaxi.cpp.o" "gcc" "fsolver/CMakeFiles/fsolver.dir/staticaxi.cpp.o.d"
+  )
+
+# Targets to which this target links which contain Fortran sources.
+set(CMAKE_Fortran_TARGET_LINKED_INFO_FILES
+  )
+
+# Targets to which this target links which contain Fortran sources.
+set(CMAKE_Fortran_TARGET_FORWARD_LINKED_INFO_FILES
+  )
+
+# Fortran module output directory.
+set(CMAKE_Fortran_TARGET_MODULE_DIR "")

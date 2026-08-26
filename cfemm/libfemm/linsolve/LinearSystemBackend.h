@@ -20,6 +20,7 @@
 #include "femmcomplex.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace femm {
@@ -45,6 +46,35 @@ struct SolveReport {
     int iterations = 0;
     double relative_residual = -1.0;
     std::string solver;
+};
+
+/** Per-evaluation instrumentation exposed by persistent sparse backends. */
+struct LinearSystemDiagnostics {
+    double bucketLookupMs = 0;
+    double bucketSwitchMs = 0;
+    double bucketConstructionMs = 0;
+    double symbolicAnalysisMs = 0;
+    double sparsePackingMs = 0;
+    double hostToDeviceMs = 0;
+    double numericFactorizationMs = 0;
+    double solveMs = 0;
+    double deviceToHostMs = 0;
+    double residualEvaluationMs = 0;
+    std::uint64_t matrixNonzeros = 0;
+    std::uint64_t factorNonzeros = 0;
+    std::uint64_t permanentDeviceBytes = 0;
+    std::uint64_t peakDeviceBytes = 0;
+    std::uint64_t hostToDeviceBytes = 0;
+    std::string bucketIdentity;
+    std::string solver;
+    double lastRelativeResidual = -1;
+    bool allConverged = true;
+    bool bucketReused = false;
+    bool symbolicReused = false;
+    bool exactTopologyFallback = false;
+    bool factorizationRetained = false;
+    bool deterministic = false;
+    std::size_t linearSolves = 0;
 };
 
 /** Non-owning view over a contiguous array of scalars.
@@ -159,6 +189,10 @@ public:
 
     /** Solve A x = b. */
     virtual SolveReport solve(const SolveOptions &options) = 0;
+
+    /** Reset/read optional detailed instrumentation for one nonlinear solve. */
+    virtual void reset_diagnostics() {}
+    virtual LinearSystemDiagnostics diagnostics() const { return {}; }
 };
 
 } // namespace femm

@@ -258,6 +258,13 @@ void FPProc::ClearDocument()
     meshelem.shrink_to_fit();
     contour.clear();
     contour.shrink_to_fit();
+    for (auto &age : agelist)
+    {
+        free(age.brc); free(age.brs); free(age.btc); free(age.bts);
+        free(age.br); free(age.bt); free(age.brcPrev); free(age.brsPrev);
+        free(age.btcPrev); free(age.btsPrev); free(age.brPrev); free(age.btPrev);
+        free(age.nh);
+    }
     agelist.clear();
     agelist.shrink_to_fit();
 
@@ -1486,7 +1493,7 @@ bool FPProc::OpenDocument(string pathname)
     return finalizeSolution();
 }
 
-bool FPProc::finalizeSolution()
+bool FPProc::finalizeSolution(bool initializeTopology)
 {
     int i, j, k;
     double b, bi, br;
@@ -1719,6 +1726,16 @@ bool FPProc::finalizeSolution()
 			}
 		}
 	}
+
+    // Repeated in-memory evaluations only change A, final nonlinear element
+    // coefficients, circuits and AGE positioning. The expensive static view
+    // setup (including Lua magnetization expressions and adjacency) is kept
+    // from the initial import.
+    if (!initializeTopology)
+    {
+        for (i=0; i<(int)meshelem.size(); i++) GetElementB(meshelem[i]);
+        return true;
+    }
 
     #ifdef DEBUG_FPPROC
     printf("Scaling length units\n");

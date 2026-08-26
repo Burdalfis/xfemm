@@ -15,3 +15,6 @@ cfemm/libfemm/femmversion.h
 *.a
 *.result.ans
 *.result.fem
+/build-cuda-benchmark/
+/build-cuda-feasibility/
+/benchmark-data/
