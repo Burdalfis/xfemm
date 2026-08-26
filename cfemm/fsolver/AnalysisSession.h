@@ -154,6 +154,10 @@ struct RealCircuitPortResult {
     double current = 0;
     double fluxLinkage = 0;
     std::optional<double> terminalVoltage;
+    /** Conventional FEMM GetFluxLinkage result, retained for validation. */
+    std::optional<double> conventionalFluxLinkage;
+    /** Direct turns-times-average-A result when applicable to a DC series winding. */
+    std::optional<double> strandedFluxLinkage;
 };
 
 struct RealAirGapHarmonic {
@@ -221,6 +225,8 @@ struct RealTrialSolution {
     std::vector<RealCircuitPortResult> circuits;
     std::vector<RealAirGapResult> airGaps;
     double torque = 0;
+    double magneticFieldEnergyJ = 0;
+    double magneticFieldCoenergyJ = 0;
 };
 
 struct TrialSolution {

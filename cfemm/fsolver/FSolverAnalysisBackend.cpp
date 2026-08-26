@@ -201,11 +201,38 @@ void FSolverAnalysisBackend::configure(const ModelDefinition &model,
                        ? constraint.value : CComplex();
         m_solver->circproplist.push_back(circuit);
     }
+
+    // Match FSolver::LoadProblemFile's series-circuit preprocessing.  Each
+    // physical stranded block gets a private flat-current-density circuit so
+    // its signed Turns multiplier is applied.  The persistent in-memory path
+    // does not call LoadProblemFile and must perform this once-per-configure
+    // transformation explicitly.
+    const std::size_t originalCircuitCount = m_solver->circproplist.size();
+    for (std::size_t i = 0; i < originalCircuitCount; ++i)
+        m_solver->circproplist[i].OrigCirc = -1;
+    for (auto &label : m_solver->labellist) {
+        if (label.InCircuit < 0)
+            continue;
+        const std::size_t original = static_cast<std::size_t>(label.InCircuit);
+        if (original >= originalCircuitCount)
+            throw std::runtime_error("block label references an invalid circuit");
+        if (m_solver->circproplist[original].CircType != 1)
+            continue;
+        CMCircuit blockCircuit = m_solver->circproplist[original];
+        blockCircuit.OrigCirc = static_cast<int>(original);
+        blockCircuit.Amps *= static_cast<double>(label.Turns);
+        label.InCircuit = static_cast<int>(m_solver->circproplist.size());
+        m_solver->circproplist.push_back(std::move(blockCircuit));
+    }
+    for (auto &circuit : m_solver->circproplist)
+        if (circuit.CircType == 1)
+            circuit.CircType = 0;
     m_solver->NumPointProps = static_cast<int>(m_solver->nodeproplist.size());
     m_solver->NumLineProps = static_cast<int>(m_solver->lineproplist.size());
     m_solver->NumBlockProps = static_cast<int>(m_solver->blockproplist.size());
     m_solver->NumBlockLabels = static_cast<int>(m_solver->labellist.size());
-    m_solver->NumCircProps = m_solver->NumCircPropsOrig = static_cast<int>(m_solver->circproplist.size());
+    m_solver->NumCircPropsOrig = static_cast<int>(originalCircuitCount);
+    m_solver->NumCircProps = static_cast<int>(m_solver->circproplist.size());
 }
 
 void FSolverAnalysisBackend::positionAirGaps(const PreparedAnalysis &prepared)
@@ -474,7 +501,8 @@ TrialSolution FSolverAnalysisBackend::solveConfigured(
         result.real->nodal.x.push_back(node.x / 100.0);
         result.real->nodal.y.push_back(node.y / 100.0);
     }
-    for (std::size_t i = 0; i < m_solver->circproplist.size(); ++i) {
+    for (std::size_t i = 0;
+         i < static_cast<std::size_t>(m_solver->NumCircPropsOrig); ++i) {
         const auto &constraint = parameters.circuitConstraints.at(CircuitId{i});
         CComplex current = constraint.kind == CircuitConstraintKind::PrescribedCurrent
                          ? constraint.value : m_solver->circproplist[i].Amps;
@@ -485,7 +513,9 @@ TrialSolution FSolverAnalysisBackend::solveConfigured(
         std::optional<double> realVoltage;
         if (voltage)
             realVoltage = voltage->re;
-        result.real->circuits.push_back({CircuitId{i}, current.re, 0.0, realVoltage});
+        result.real->circuits.push_back(
+            {CircuitId{i}, current.re, 0.0, realVoltage,
+             std::nullopt, std::nullopt});
     }
     const double resultPackagingMs =
         std::chrono::duration<double, std::milli>(

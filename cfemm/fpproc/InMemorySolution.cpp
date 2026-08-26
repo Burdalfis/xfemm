@@ -19,8 +19,74 @@ std::vector<int> copyPhysicalLabels(const FSolver &solver,
         if (solver.labellist[i].BlockType < 0) continue;
         mapping[i] = static_cast<int>(target.size());
         target.push_back(solver.labellist[i]);
+        auto &label = target.back();
+        if (label.InCircuit >= 0 &&
+            label.InCircuit < static_cast<int>(solver.circproplist.size())) {
+            const int original = solver.circproplist[
+                static_cast<std::size_t>(label.InCircuit)].OrigCirc;
+            if (original >= 0)
+                label.InCircuit = original;
+        }
     }
     return mapping;
+}
+
+void copyOriginalCircuits(const FSolver &solver,
+                          std::vector<femm::CMCircuit> &target,
+                          const femm::FemmProblem *problem)
+{
+    const std::size_t count = static_cast<std::size_t>(solver.NumCircPropsOrig);
+    if (count > solver.circproplist.size())
+        throw std::runtime_error("solver original circuit count is invalid");
+    std::vector<int> circuitTypes;
+    circuitTypes.reserve(count);
+    if (problem) {
+        if (problem->circproplist.size() != count)
+            throw std::runtime_error("model/solver circuit count mismatch");
+        for (const auto &property : problem->circproplist) {
+            const auto *circuit = dynamic_cast<const femm::CMCircuit *>(property.get());
+            if (!circuit)
+                throw std::runtime_error("magnetic model contains a non-magnetic circuit");
+            circuitTypes.push_back(circuit->CircType);
+        }
+    } else {
+        if (target.size() != count)
+            throw std::runtime_error("persistent postprocessor circuit count changed");
+        for (const auto &circuit : target)
+            circuitTypes.push_back(circuit.CircType);
+    }
+    target.assign(solver.circproplist.begin(),
+                  solver.circproplist.begin() + static_cast<std::ptrdiff_t>(count));
+    for (std::size_t i = 0; i < count; ++i)
+        target[i].CircType = circuitTypes[i];
+}
+
+void copyPhysicalCircuitState(const FSolver &solver,
+                              const std::vector<int> &mapping,
+                              std::vector<femm::CMBlockLabel> &target)
+{
+    for (std::size_t source = 0; source < solver.labellist.size(); ++source) {
+        if (source >= mapping.size() || mapping[source] < 0)
+            continue;
+        auto &label = target[static_cast<std::size_t>(mapping[source])];
+        const int circuit = solver.labellist[source].InCircuit;
+        if (circuit < 0) {
+            label.Case = 1;
+            label.J = 0.;
+        } else {
+            if (circuit >= static_cast<int>(solver.circproplist.size()))
+                throw std::runtime_error("solver block label circuit is invalid");
+            const auto &solvedCircuit = solver.circproplist[
+                static_cast<std::size_t>(circuit)];
+            if (solvedCircuit.Case == 0) {
+                label.Case = 0;
+                label.dVolts = solvedCircuit.dVolts;
+            } else {
+                label.Case = 1;
+                label.J = solvedCircuit.J;
+            }
+        }
+    }
 }
 
 void releaseAirGapFields(femmsolver::CAirGapElement &age)
@@ -90,7 +156,7 @@ bool FPProc::OpenDocument(const femm::FemmProblem &problem, const FSolver &solve
         if (item.BHpoints > 0 && item.slope.size() < static_cast<std::size_t>(item.BHpoints))
             throw std::runtime_error("could not prepare nonlinear material slopes");
     }
-    circproplist = solver.circproplist;
+    copyOriginalCircuits(solver, circproplist, &problem);
 
     const double centimetresPerSourceUnit[] = {2.54, 0.1, 1., 100., 0.00254, 1.e-04};
     const double coordinateScale = centimetresPerSourceUnit[LengthUnits];
@@ -123,19 +189,7 @@ bool FPProc::OpenDocument(const femm::FemmProblem &problem, const FSolver &solve
     pmeshnode = &meshnode;
     pmeshelem = &meshelem;
 
-    for (std::size_t i = 0; i < blocklist.size(); ++i) {
-        const int circuit = blocklist[i].InCircuit;
-        if (circuit < 0) {
-            blocklist[i].Case = 1;
-            blocklist[i].J = 0.;
-        } else if (circproplist[circuit].Case == 0) {
-            blocklist[i].Case = 0;
-            blocklist[i].dVolts = circproplist[circuit].dVolts;
-        } else {
-            blocklist[i].Case = 1;
-            blocklist[i].J = circproplist[circuit].J;
-        }
-    }
+    copyPhysicalCircuitState(solver, labelMapping, blocklist);
 
     return finalizeSolution();
 }
@@ -151,7 +205,7 @@ bool FPProc::UpdateSolution(const FSolver &solver,
     Frequency = solver.Frequency;
     Precision = solver.Precision;
     const auto labelMapping = copyPhysicalLabels(solver, blocklist);
-    circproplist = solver.circproplist;
+    copyOriginalCircuits(solver, circproplist, nullptr);
     for (std::size_t i = 0; i < meshnode.size(); ++i)
         meshnode[i].A = solution.rhs()[i];
     for (std::size_t i = 0; i < meshelem.size(); ++i) {
@@ -174,18 +228,6 @@ bool FPProc::UpdateSolution(const FSolver &solver,
     }
     NumAirGapElems = static_cast<int>(agelist.size());
 
-    for (std::size_t i = 0; i < blocklist.size(); ++i) {
-        const int circuit = blocklist[i].InCircuit;
-        if (circuit < 0) {
-            blocklist[i].Case = 1;
-            blocklist[i].J = 0.;
-        } else if (circproplist[circuit].Case == 0) {
-            blocklist[i].Case = 0;
-            blocklist[i].dVolts = circproplist[circuit].dVolts;
-        } else {
-            blocklist[i].Case = 1;
-            blocklist[i].J = circproplist[circuit].J;
-        }
-    }
+    copyPhysicalCircuitState(solver, labelMapping, blocklist);
     return finalizeSolution(false);
 }

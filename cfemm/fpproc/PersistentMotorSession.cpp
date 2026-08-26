@@ -15,6 +15,28 @@ double elapsedMs(Clock::time_point start)
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
 
+std::optional<CComplex> strandedSeriesFluxLinkage(
+    const FPProc &postProcessor, int circuit)
+{
+    // GetFluxLinkage's A.J/conj(I) path is algebraically equivalent for a
+    // nonzero series-circuit current, but it changes algorithms at I == 0.
+    // Transient finite differences must remain continuous through current
+    // zero.  For DC planar stranded windings, directly summing turns times
+    // average A is valid at every current and is already the established FEMM
+    // zero-current calculation.
+    if (postProcessor.Frequency == 0 &&
+        postProcessor.problemType == femm::PLANAR &&
+        postProcessor.circproplist.at(static_cast<std::size_t>(circuit)).CircType == 1) {
+        CComplex linkage;
+        for (std::size_t label = 0; label < postProcessor.blocklist.size(); ++label)
+            if (postProcessor.blocklist[label].InCircuit == circuit)
+                linkage += postProcessor.GetStrandedLinkage(
+                    static_cast<int>(label));
+        return linkage;
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
 PersistentMotorSession::PersistentMotorSession(ModelDefinition model)
@@ -104,8 +126,15 @@ void PersistentMotorSession::addPhysicalResults(TrialSolution &trial)
 
     const auto fluxStarted = Clock::now();
     for (std::size_t i = 0; i < trial.real->circuits.size(); ++i) {
-        const CComplex linkage = m_postProcessor->GetFluxLinkage(static_cast<int>(i));
+        const CComplex conventional = m_postProcessor->GetFluxLinkage(
+            static_cast<int>(i));
+        const auto stranded = strandedSeriesFluxLinkage(
+            *m_postProcessor, static_cast<int>(i));
+        const CComplex linkage = stranded.value_or(conventional);
         trial.real->circuits[i].fluxLinkage = linkage.re;
+        trial.real->circuits[i].conventionalFluxLinkage = conventional.re;
+        if (stranded)
+            trial.real->circuits[i].strandedFluxLinkage = stranded->re;
         trial.circuits[i].fluxLinkage = linkage;
     }
     trial.diagnostics.fluxLinkageMs = elapsedMs(fluxStarted);
@@ -129,6 +158,27 @@ void PersistentMotorSession::addPhysicalResults(TrialSolution &trial)
         trial.real->airGaps.push_back(std::move(result));
     }
     trial.diagnostics.torqueMs = elapsedMs(torqueStarted);
+
+    std::vector<bool> selected;
+    selected.reserve(m_postProcessor->blocklist.size());
+    for (auto &label : m_postProcessor->blocklist) {
+        selected.push_back(label.IsSelected);
+        label.IsSelected = true;
+    }
+    trial.real->magneticFieldEnergyJ = m_postProcessor->BlockIntegral(2).re;
+    trial.real->magneticFieldCoenergyJ = m_postProcessor->BlockIntegral(17).re;
+    for (const auto &gap : m_postProcessor->agelist) {
+        CComplex gapEnergy;
+        if (m_postProcessor->gapTimeAvgStoredEnergyIntegral(
+                gap.BdryName, gapEnergy) != FPProcError::NoError)
+            throw std::runtime_error(
+                "could not calculate AGE stored energy for " + gap.BdryName);
+        // The AGE is a linear air region, so its energy and coenergy are equal.
+        trial.real->magneticFieldEnergyJ += gapEnergy.re;
+        trial.real->magneticFieldCoenergyJ += gapEnergy.re;
+    }
+    for (std::size_t i = 0; i < selected.size(); ++i)
+        m_postProcessor->blocklist[i].IsSelected = selected[i];
 }
 
 std::shared_ptr<const AcceptedState>

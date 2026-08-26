@@ -4,6 +4,7 @@
 #include "linsolve/CudssLinearSystemBackend.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -291,6 +292,57 @@ int main(int argc, char **argv)
             repeated.diagnostics.exactTopologyFallback ||
             !repeated.diagnostics.bucketReused)
             return fail("repeated canonical evaluation did not reuse committed resources");
+
+        // Exercise the ESC-relevant case: one branch crosses exact zero while
+        // the other two stay substantially loaded.  Check every returned
+        // linkage, not only the linkage of the crossing branch.
+        constexpr std::array<double, 5> crossingCurrents{
+            -0.1, -0.01, 0.0, 0.01, 0.1};
+        for (std::size_t crossing = 0; crossing < 3; ++crossing) {
+            for (double backgroundSign : {1.0, -1.0}) {
+                std::array<std::array<double, 3>, 5> linkages{};
+                for (std::size_t sample = 0; sample < crossingCurrents.size();
+                     ++sample) {
+                    std::array<double, 3> currents{};
+                    currents[crossing] = crossingCurrents[sample];
+                    currents[(crossing + 1) % 3] = backgroundSign * 4.0;
+                    currents[(crossing + 2) % 3] = backgroundSign * -2.0;
+                    gpu.analysis().updateSolveParameters(
+                        [&](femm::SolveParameters &parameters) {
+                            for (std::size_t i = 0; i < currents.size(); ++i)
+                                parameters.circuitConstraints[femm::CircuitId{i}] = {
+                                    femm::CircuitConstraintKind::PrescribedCurrent,
+                                    CComplex(currents[i], 0)};
+                        });
+                    const auto trial = gpu.evaluateTrial();
+                    if (!trial.real || !trial.diagnostics.nonlinearWarmStartUsed)
+                        return fail("loaded zero-crossing trial payload/warm start missing");
+                    for (std::size_t i = 0; i < 3; ++i)
+                        linkages[sample][i] = trial.real->circuits[i].fluxLinkage;
+                }
+                for (std::size_t linkage = 0; linkage < 3; ++linkage) {
+                    const double negative = linkages[1][linkage];
+                    const double zero = linkages[2][linkage];
+                    const double positive = linkages[3][linkage];
+                    const double midpointDefect =
+                        std::abs(zero - 0.5 * (negative + positive));
+                    const double localVariation = std::max(
+                        {std::abs(positive - negative),
+                         std::abs(zero - negative),
+                         std::abs(positive - zero)});
+                    if (midpointDefect > 5e-10 + 0.05 * localVariation)
+                        return fail("loaded linkage is discontinuous through zero current");
+                    const double leftSlope = (zero - negative) / 0.01;
+                    const double rightSlope = (positive - zero) / 0.01;
+                    const double slopeScale =
+                        std::max(std::abs(leftSlope), std::abs(rightSlope));
+                    if (std::abs(rightSlope - leftSlope) >
+                        5e-8 + 0.15 * slopeScale)
+                        return fail("loaded linkage slope is not smooth through zero current");
+                }
+            }
+        }
+        gpu.rollbackToCommitted();
         if (gpu.analysis().meshGenerationCount() != 1)
             return fail("persistent evaluations unexpectedly regenerated the mesh");
         if (gpu.topologyImportCount() != 1 || gpu.orderingCount() != 1 ||
