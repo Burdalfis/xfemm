@@ -93,7 +93,7 @@ int main(int argc, char **argv)
             femm::ModelDefinition(loadProblem(argv[1])));
         femm::PersistentMotorSession gpu(
             femm::ModelDefinition(loadProblem(argv[1])),
-            femm::CudssSessionOptions{1.2, false, false});
+            femm::CudssSessionOptions{1.2, false, false, 2});
 
         gpu.initialize();
         const auto initialization = gpu.initializationDiagnostics();
@@ -343,6 +343,93 @@ int main(int argc, char **argv)
             }
         }
         gpu.rollbackToCommitted();
+
+        // Bound expensive device contexts while retaining host-side bucket
+        // definitions. Start from a known bucket, reject a trial in its
+        // neighbor, roll back, then commit monotonically through enough
+        // buckets to force eviction. Nodal state lives at session scope, so
+        // neither eviction nor bucket switching may discard the warm field.
+        const std::array<double, 3> cacheCurrents{1.5, -0.75, 0.25};
+        const auto setCacheState = [&](double relativeAngle) {
+            gpu.analysis().updateSolveParameters(
+                [&](femm::SolveParameters &parameters) {
+                    parameters.airGapPositions[gap] = {
+                        originalInner + relativeAngle, originalOuter};
+                    for (std::size_t i = 0; i < cacheCurrents.size(); ++i)
+                        parameters.circuitConstraints[femm::CircuitId{i}] = {
+                            femm::CircuitConstraintKind::PrescribedCurrent,
+                            CComplex(cacheCurrents[i], 0)};
+                });
+        };
+        setCacheState(12.2); // bucket 10 for a 1.2-degree cache
+        const auto cacheCommitted = gpu.evaluateTrial();
+        if (!cacheCommitted.real ||
+            !cacheCommitted.diagnostics.nonlinearWarmStartUsed)
+            return fail("cache test committed-state warm start missing");
+        gpu.commitTrial(cacheCommitted);
+
+        setCacheState(13.4); // rejected trial across the 10 -> 11 boundary
+        const auto crossBoundaryRejected = gpu.evaluateTrial();
+        if (!crossBoundaryRejected.real ||
+            !crossBoundaryRejected.diagnostics.nonlinearWarmStartUsed ||
+            crossBoundaryRejected.diagnostics.bucketIdentity ==
+                cacheCommitted.diagnostics.bucketIdentity ||
+            gpu.residentBucketCount() > 2)
+            return fail("cross-boundary rejected trial did not retain a bounded warm cache");
+        gpu.rollbackToCommitted();
+        if (gpu.residentBucketCount() > 2)
+            return fail("rollback exceeded the cuDSS bucket cache capacity");
+        setCacheState(12.2);
+        const auto cacheRestored = gpu.evaluateTrial();
+        if (!cacheRestored.real ||
+            cacheRestored.diagnostics.bucketIdentity !=
+                cacheCommitted.diagnostics.bucketIdentity ||
+            !cacheRestored.diagnostics.bucketReused ||
+            !cacheRestored.diagnostics.symbolicReused ||
+            !cacheRestored.diagnostics.nonlinearWarmStartUsed ||
+            relativeVectorError(
+                cacheCommitted.real->nodal.magneticVectorPotential,
+                cacheRestored.real->nodal.magneticVectorPotential) > 1e-9)
+            return fail("cross-boundary rollback did not restore the committed warm state");
+        gpu.commitTrial(cacheRestored);
+
+        const std::size_t evictionsBefore = gpu.bucketEvictionCount();
+        femm::TrialSolution lastCommitted = cacheRestored;
+        for (double relativeAngle : {13.4, 14.6, 15.8, 17.0}) {
+            setCacheState(relativeAngle);
+            auto next = gpu.evaluateTrial();
+            if (!next.real || !next.diagnostics.nonlinearWarmStartUsed ||
+                next.diagnostics.residentBucketCount > 2 ||
+                gpu.residentBucketCount() > 2)
+                return fail("monotonic bucket crossing lost warm start or cache bound");
+            gpu.commitTrial(next);
+            lastCommitted = std::move(next);
+        }
+        if (gpu.bucketEvictionCount() <= evictionsBefore ||
+            gpu.residentBucketCount() != 2 ||
+            gpu.bucketDefinitionCount() < 5)
+            return fail("bounded cache did not evict device contexts while retaining definitions");
+
+        // Revisit an evicted bucket. It should reanalyze its retained host
+        // definition, while the last committed bucket stays resident for a
+        // subsequent rollback.
+        setCacheState(12.2);
+        const auto recreated = gpu.evaluateTrial();
+        if (!recreated.real || recreated.diagnostics.bucketReused ||
+            recreated.diagnostics.symbolicAnalysisMs <= 0 ||
+            !recreated.diagnostics.nonlinearWarmStartUsed ||
+            gpu.residentBucketCount() != 2)
+            return fail("evicted bucket was not safely recreated from host metadata");
+        gpu.rollbackToCommitted();
+        setCacheState(17.0);
+        const auto finalRestored = gpu.evaluateTrial();
+        if (!finalRestored.real || !finalRestored.diagnostics.bucketReused ||
+            !finalRestored.diagnostics.symbolicReused ||
+            relativeVectorError(
+                lastCommitted.real->nodal.magneticVectorPotential,
+                finalRestored.real->nodal.magneticVectorPotential) > 1e-9)
+            return fail("rollback failed after recreating an evicted trial bucket");
+
         if (gpu.analysis().meshGenerationCount() != 1)
             return fail("persistent evaluations unexpectedly regenerated the mesh");
         if (gpu.topologyImportCount() != 1 || gpu.orderingCount() != 1 ||

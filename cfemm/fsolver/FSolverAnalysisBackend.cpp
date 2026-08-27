@@ -149,6 +149,9 @@ FSolverAnalysisBackend::FSolverAnalysisBackend(CudssSessionOptions options)
     if (!std::isfinite(options.bucketWidthDegrees) ||
         options.bucketWidthDegrees <= 0 || options.bucketWidthDegrees > 360)
         throw std::invalid_argument("cuDSS AGE bucket width must be in (0, 360] degrees");
+    if (options.bucketCacheCapacity < 2)
+        throw std::invalid_argument(
+            "cuDSS bucket cache capacity must be at least two");
 #ifndef XFEMM_USE_CUDSS
     throw std::runtime_error(
         "persistent cuDSS support was not built; configure with -DXFEMM_USE_CUDSS=ON");
@@ -341,6 +344,7 @@ void FSolverAnalysisBackend::synchronize(const ModelDefinition &model,
         m_haveCommittedSolution = false;
 #ifdef XFEMM_USE_CUDSS
         m_currentBucket = {};
+        m_committedBucketIdentity.clear();
         m_cudssBuckets.clear();
 #endif
         m_pendingBucketConstructionMs = 0;
@@ -398,7 +402,8 @@ TrialSolution FSolverAnalysisBackend::solveConfigured(
         if (m_useCudss) {
 #ifdef XFEMM_USE_CUDSS
             return std::unique_ptr<femm::LinearSystemBackend<double>>(
-                new CudssLinearSystemBackend({m_cudssOptions.deterministic}));
+                new CudssLinearSystemBackend({m_cudssOptions.deterministic,
+                                              m_cudssOptions.bucketCacheCapacity}));
 #else
             throw std::runtime_error("cuDSS backend is not available in this build");
 #endif
@@ -551,6 +556,9 @@ TrialSolution FSolverAnalysisBackend::solveConfigured(
     result.diagnostics.permanentDeviceBytes = linear.permanentDeviceBytes;
     result.diagnostics.peakDeviceBytes = linear.peakDeviceBytes;
     result.diagnostics.hostToDeviceBytes = linear.hostToDeviceBytes;
+    result.diagnostics.residentBucketCount = linear.residentBucketCount;
+    result.diagnostics.bucketCacheCapacity = linear.bucketCacheCapacity;
+    result.diagnostics.bucketEvictions = linear.bucketEvictions;
     result.diagnostics.nonlinearIterations = m_solver->newtonIterations();
     result.diagnostics.relativeResidual = linear.lastRelativeResidual;
     result.diagnostics.linearSolver = linear.solver.empty()
@@ -582,6 +590,11 @@ void FSolverAnalysisBackend::initialize(const ModelDefinition &model,
     TrialSolution initialized = solveConfigured(model, parameters, prepared, true);
     m_committedSolution = m_trialSolution;
     m_haveCommittedSolution = m_haveTrialSolution;
+#ifdef XFEMM_USE_CUDSS
+    m_committedBucketIdentity = m_currentBucket.identity;
+    if (auto *cudss = dynamic_cast<CudssLinearSystemBackend *>(m_lastSystem.get()))
+        cudss->setCommittedBucket(m_committedBucketIdentity);
+#endif
     m_initializationMs += std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - started).count();
     m_initializationDiagnostics = initialized.diagnostics;
@@ -595,6 +608,11 @@ void FSolverAnalysisBackend::commitTrial(const TrialSolution &)
         return;
     m_committedSolution = m_trialSolution;
     m_haveCommittedSolution = true;
+#ifdef XFEMM_USE_CUDSS
+    m_committedBucketIdentity = m_currentBucket.identity;
+    if (auto *cudss = dynamic_cast<CudssLinearSystemBackend *>(m_lastSystem.get()))
+        cudss->setCommittedBucket(m_committedBucketIdentity);
+#endif
 }
 
 void FSolverAnalysisBackend::rollbackToCommitted()
@@ -605,6 +623,14 @@ void FSolverAnalysisBackend::rollbackToCommitted()
         throw std::logic_error("there is no committed magnetic state to restore");
     m_trialSolution = m_committedSolution;
     m_haveTrialSolution = true;
+#ifdef XFEMM_USE_CUDSS
+    if (auto *cudss = dynamic_cast<CudssLinearSystemBackend *>(m_lastSystem.get())) {
+        const auto definition = m_cudssBuckets.find(m_committedBucketIdentity);
+        if (definition == m_cudssBuckets.end())
+            throw std::logic_error("committed cuDSS bucket definition is unavailable");
+        cudss->activateBucket(definition->second);
+    }
+#endif
     if (m_lastSystem &&
         m_lastSystem->dimension() == static_cast<int>(m_trialSolution.size())) {
         std::copy(m_trialSolution.begin(), m_trialSolution.end(),
@@ -613,6 +639,26 @@ void FSolverAnalysisBackend::rollbackToCommitted()
         for (std::size_t i = 0; i < m_trialSolution.size(); ++i)
             m_lastSystem->rhs()[i] = m_trialSolution[i] * outputScale;
     }
+}
+
+std::size_t FSolverAnalysisBackend::residentBucketCount() const
+{
+#ifdef XFEMM_USE_CUDSS
+    if (const auto *cudss = dynamic_cast<const CudssLinearSystemBackend *>(
+            m_lastSystem.get()))
+        return cudss->residentBucketCount();
+#endif
+    return 0;
+}
+
+std::size_t FSolverAnalysisBackend::bucketEvictionCount() const
+{
+#ifdef XFEMM_USE_CUDSS
+    if (const auto *cudss = dynamic_cast<const CudssLinearSystemBackend *>(
+            m_lastSystem.get()))
+        return cudss->bucketEvictionCount();
+#endif
+    return 0;
 }
 
 void FSolverAnalysisBackend::writeSolution(const std::string &ansPath)

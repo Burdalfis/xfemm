@@ -29,6 +29,8 @@ struct CudssSessionOptions {
     bool deterministic = false;
     /** If true, a failed CUDA evaluation is restarted explicitly on Legacy. */
     bool explicitLegacyFallback = false;
+    /** Bounded resident cuDSS bucket cache; two retains committed plus trial. */
+    std::size_t bucketCacheCapacity = 2;
 };
 
 class FSolverAnalysisBackend final : public AnalysisSolverBackend {
@@ -67,6 +69,16 @@ public:
     bool usesPersistentCudss() const { return m_useCudss; }
     const EvaluationDiagnostics &initializationDiagnostics() const
     { return m_initializationDiagnostics; }
+    std::size_t residentBucketCount() const;
+    std::size_t bucketEvictionCount() const;
+    std::size_t bucketDefinitionCount() const
+    {
+#ifdef XFEMM_USE_CUDSS
+        return m_cudssBuckets.size();
+#else
+        return 0;
+#endif
+    }
 
 private:
     void configure(const ModelDefinition &, const SolveParameters &,
@@ -86,6 +98,7 @@ private:
     CudssSessionOptions m_cudssOptions;
 #ifdef XFEMM_USE_CUDSS
     CudssBucketDefinition m_currentBucket;
+    std::string m_committedBucketIdentity;
     std::map<std::string, CudssBucketDefinition> m_cudssBuckets;
 #endif
     std::vector<double> m_committedSolution;

@@ -402,11 +402,48 @@ public:
         CudssBucketDefinition definition;
         std::unique_ptr<CudssContext> unionContext;
         std::unordered_map<std::uint64_t, std::unique_ptr<CudssContext>> exactContexts;
+        std::uint64_t lastUsed = 0;
     };
 
     explicit Implementation(CudssBackendOptions requested) : options(requested)
     {
+        if (options.bucketCacheCapacity < 2)
+            throw std::invalid_argument(
+                "cuDSS bucket cache capacity must retain committed and trial buckets");
         diagnostics.deterministic = options.deterministic;
+        diagnostics.bucketCacheCapacity = options.bucketCacheCapacity;
+    }
+
+    void evictIfNeeded()
+    {
+        while (buckets.size() > options.bucketCacheCapacity) {
+            auto victim = buckets.end();
+            for (auto it = buckets.begin(); it != buckets.end(); ++it) {
+                if (it->second.get() == active ||
+                    it->first == committedBucketIdentity)
+                    continue;
+                if (victim == buckets.end() ||
+                    it->second->lastUsed < victim->second->lastUsed)
+                    victim = it;
+            }
+            // A capacity of two is enough for the only two pinned states:
+            // current trial and committed. Reaching this guard would mean a
+            // future caller introduced another pin without raising capacity.
+            if (victim == buckets.end())
+                throw std::logic_error("cuDSS bucket cache has no evictable entry");
+            buckets.erase(victim);
+            ++totalEvictions;
+            ++diagnostics.bucketEvictions;
+        }
+        diagnostics.residentBucketCount = buckets.size();
+    }
+
+    void setCommitted(const std::string &identity)
+    {
+        if (!identity.empty() && buckets.find(identity) == buckets.end())
+            throw std::logic_error("cannot pin a nonresident cuDSS bucket");
+        committedBucketIdentity = identity;
+        evictIfNeeded();
     }
 
     Bucket &ensureActive()
@@ -431,9 +468,11 @@ public:
             throw std::logic_error("create must be called before selecting a cuDSS bucket");
         if (definition.identity.empty()) definition.identity = "exact-default";
         if (active && active->definition.identity == definition.identity) {
+            active->lastUsed = ++useClock;
             diagnostics.bucketIdentity = definition.identity;
             diagnostics.bucketReused = true;
             diagnostics.bucketLookupMs += elapsedMs(lookupStarted);
+            diagnostics.residentBucketCount = buckets.size();
             return;
         }
 
@@ -468,11 +507,13 @@ public:
             sessionSolution.assign(active->assembly->V,
                                    active->assembly->V + dimension);
         active = found->second.get();
+        active->lastUsed = ++useClock;
         if (!sessionSolution.empty())
             std::copy(sessionSolution.begin(), sessionSolution.end(), active->assembly->V);
         bind(*active);
         diagnostics.bucketIdentity = active->definition.identity;
         diagnostics.bucketSwitchMs += elapsedMs(switchStarted);
+        evictIfNeeded();
     }
 
     HostCsr exactMatrix()
@@ -488,6 +529,9 @@ public:
     double precision = 1e-8;
     std::map<std::string, std::unique_ptr<Bucket>> buckets;
     Bucket *active = nullptr;
+    std::string committedBucketIdentity;
+    std::uint64_t useClock = 0;
+    std::size_t totalEvictions = 0;
     std::vector<double> sessionSolution;
     ScalarView<double> rhs;
     ScalarView<double> solution;
@@ -504,6 +548,21 @@ CudssLinearSystemBackend::~CudssLinearSystemBackend() = default;
 void CudssLinearSystemBackend::activateBucket(const CudssBucketDefinition &definition)
 {
     m_impl->activate(definition);
+}
+
+void CudssLinearSystemBackend::setCommittedBucket(const std::string &identity)
+{
+    m_impl->setCommitted(identity);
+}
+
+std::size_t CudssLinearSystemBackend::residentBucketCount() const
+{
+    return m_impl->buckets.size();
+}
+
+std::size_t CudssLinearSystemBackend::bucketEvictionCount() const
+{
+    return m_impl->totalEvictions;
 }
 
 bool CudssLinearSystemBackend::create(int dimension, int bandwidth, int)
@@ -630,6 +689,8 @@ void CudssLinearSystemBackend::reset_diagnostics()
     m_impl->diagnostics = {};
     m_impl->diagnostics.deterministic = deterministic;
     m_impl->diagnostics.bucketIdentity = bucket;
+    m_impl->diagnostics.residentBucketCount = m_impl->buckets.size();
+    m_impl->diagnostics.bucketCacheCapacity = m_impl->options.bucketCacheCapacity;
     m_impl->diagnostics.allConverged = true;
 }
 

@@ -23,6 +23,8 @@ struct CudssBucketDefinition {
 
 struct CudssBackendOptions {
     bool deterministic = false;
+    /** Maximum resident assembly/cuDSS contexts. Must allow committed + trial. */
+    std::size_t bucketCacheCapacity = 2;
 };
 
 /**
@@ -43,6 +45,10 @@ public:
 
     /** Select a bucket before wipe/assembly. An analyzed bucket is immutable. */
     void activateBucket(const CudssBucketDefinition &definition);
+    /** Pin the accepted bucket; updating the pin may evict an older context. */
+    void setCommittedBucket(const std::string &identity);
+    std::size_t residentBucketCount() const;
+    std::size_t bucketEvictionCount() const;
 
     ScalarType scalar_type() const override { return ScalarType::Real; }
     bool create(int dimension, int bandwidth, int node_count = -1) override;

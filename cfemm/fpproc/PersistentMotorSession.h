@@ -35,6 +35,9 @@ public:
     std::size_t orderingCount() const { return m_backend->orderingCount(); }
     std::size_t meshFileReadCount() const { return m_backend->meshFileReadCount(); }
     std::size_t meshFileWriteCount() const { return m_backend->meshFileWriteCount(); }
+    std::size_t residentBucketCount() const { return m_backend->residentBucketCount(); }
+    std::size_t bucketEvictionCount() const { return m_backend->bucketEvictionCount(); }
+    std::size_t bucketDefinitionCount() const { return m_backend->bucketDefinitionCount(); }
 
     /**
      * Pay the initial cuDSS bucket construction/symbolic/factorization and

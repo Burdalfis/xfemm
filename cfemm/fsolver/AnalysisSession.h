@@ -205,6 +205,9 @@ struct EvaluationDiagnostics {
     std::uint64_t permanentDeviceBytes = 0;
     std::uint64_t peakDeviceBytes = 0;
     std::uint64_t hostToDeviceBytes = 0;
+    std::size_t residentBucketCount = 0;
+    std::size_t bucketCacheCapacity = 0;
+    std::size_t bucketEvictions = 0;
     int nonlinearIterations = 0;
     double relativeResidual = -1;
     std::string linearSolver;
