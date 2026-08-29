@@ -71,6 +71,9 @@ public:
     double precision() const override;
     void set_precision(double p) override;
     SolveReport solve(const SolveOptions &options) override;
+    RetainedFactorizationSolveReport solveRetainedFactorization(
+        const std::vector<double> &rightHandSides,
+        std::size_t rightHandSideCount) override;
     void reset_diagnostics() override;
     LinearSystemDiagnostics diagnostics() const override;
 

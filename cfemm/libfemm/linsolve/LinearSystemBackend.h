@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace femm {
 
@@ -46,6 +47,18 @@ struct SolveReport {
     int iterations = 0;
     double relative_residual = -1.0;
     std::string solver;
+};
+
+/** Timings for additional right-hand sides solved against an already
+ *  factorized matrix. Values and symbolic/numeric factors must not change. */
+struct RetainedFactorizationSolveReport {
+    std::vector<double> solutions;
+    double hostToDeviceMs = 0;
+    double solveMs = 0;
+    double deviceToHostMs = 0;
+    std::size_t rightHandSides = 0;
+    std::size_t solveCalls = 0;
+    bool reusedFactorization = false;
 };
 
 /** Per-evaluation instrumentation exposed by persistent sparse backends. */
@@ -192,6 +205,14 @@ public:
 
     /** Solve A x = b. */
     virtual SolveReport solve(const SolveOptions &options) = 0;
+
+    /** Solve column-major right-hand sides against the most recently
+     * factorized matrix without assembly or numeric refactorization. */
+    virtual RetainedFactorizationSolveReport solveRetainedFactorization(
+        const std::vector<Scalar> &, std::size_t)
+    {
+        return {};
+    }
 
     /** Reset/read optional detailed instrumentation for one nonlinear solve. */
     virtual void reset_diagnostics() {}

@@ -146,7 +146,12 @@ public:
     bool usedSweepWarmStart() const { return sweepWarmStartUsed; }
     bool remappedSweepWarmStart() const { return sweepWarmStartRemapped; }
     int newtonIterations() const { return lastNewtonIterations; }
+    double finalNewtonRelativeUpdate() const { return lastNewtonRelativeUpdate; }
     const StaticSolveTimings &staticSolveTimings() const { return lastStaticSolveTimings; }
+    /** Apply the homogeneous part of Static2D's Dirichlet and periodic
+     * constraints to column-major sensitivity right-hand sides. */
+    void transformStatic2DSensitivityRhs(std::vector<double> &rightHandSides,
+                                         std::size_t rightHandSideCount) const;
     /** Session-only seed marker; direct solvers ignore it as a linear initial guess. */
     void setSessionWarmStartUsed(bool used) { sweepWarmStartUsed = used; }
 
@@ -194,6 +199,7 @@ private:
     bool sweepWarmStartUsed = false;
     bool sweepWarmStartRemapped = false;
     int lastNewtonIterations = 0;
+    double lastNewtonRelativeUpdate = 0;
     StaticSolveTimings lastStaticSolveTimings;
 };
 

@@ -694,4 +694,19 @@ const femm::LinearSystemBackend<double> &FSolverAnalysisBackend::solvedSystem() 
     return *m_lastSystem;
 }
 
+femm::RetainedFactorizationSolveReport
+FSolverAnalysisBackend::solveRetainedFactorization(
+    const std::vector<double> &rightHandSides,
+    std::size_t rightHandSideCount)
+{
+    if (!m_lastSystem)
+        throw std::logic_error("there is no solved tangent factorization");
+    auto result = m_lastSystem->solveRetainedFactorization(
+        rightHandSides, rightHandSideCount);
+    if (!result.reusedFactorization)
+        throw std::runtime_error(
+            "active linear backend cannot reuse a retained factorization");
+    return result;
+}
+
 } // namespace femm

@@ -57,6 +57,9 @@ public:
     /** Native solved state used to construct an in-memory post-processor view. */
     const FSolver &solvedSolver() const;
     const femm::LinearSystemBackend<double> &solvedSystem() const;
+    femm::RetainedFactorizationSolveReport solveRetainedFactorization(
+        const std::vector<double> &rightHandSides,
+        std::size_t rightHandSideCount);
 
     std::size_t topologyImportCount() const { return m_topologyImports; }
     std::size_t orderingCount() const { return m_orderings; }

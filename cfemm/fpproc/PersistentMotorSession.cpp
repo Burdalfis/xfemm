@@ -2,6 +2,7 @@
 
 #include "fpproc.h"
 #include "femmenums.h"
+#include "femmconstants.h"
 
 #include <algorithm>
 #include <chrono>
@@ -241,6 +242,66 @@ void PersistentMotorSession::completeTrial(TrialSolution &trial,
     }
     trial.real->physicalResultLevel = level;
     trial.diagnostics.totalEvaluateMs += elapsedMs(completionStarted);
+}
+
+MagneticTangentResult PersistentMotorSession::extractTrialTangent()
+{
+    if (m_lastEvaluatedTrialId == 0)
+        throw std::logic_error("evaluateTrial must precede tangent extraction");
+    initializeDirectLinkageExtractor();
+    if (!m_directLinkageAvailable)
+        throw std::runtime_error(
+            "magnetic tangent extraction requires planar DC stranded-series linkage");
+
+    const auto totalStarted = Clock::now();
+    const auto &problem = m_session.model().problem();
+    const auto &solver = m_backend->solvedSolver();
+    const std::size_t branches = m_directLinkageWeights.size();
+    const std::size_t nodes = solver.meshnode.size();
+    const double depth = problem.Depth == -1
+        ? 1.0
+        : problem.Depth * LengthConvMeters[problem.LengthUnits];
+    if (!(depth > 0))
+        throw std::runtime_error("planar motor model has invalid depth");
+
+    MagneticTangentResult result;
+    result.diagnostics.branchCount = branches;
+    result.diagnostics.finalNewtonRelativeUpdate =
+        solver.finalNewtonRelativeUpdate();
+    const auto rhsStarted = Clock::now();
+    std::vector<double> rightHandSides(nodes * branches, 0.0);
+    const double sourcePerLinkageWeight = 0.01 / depth;
+    for (std::size_t branch = 0; branch < branches; ++branch) {
+        if (m_directLinkageWeights[branch].size() != nodes)
+            throw std::logic_error("direct linkage weight dimension changed");
+        for (std::size_t node = 0; node < nodes; ++node)
+            rightHandSides[branch * nodes + node] =
+                sourcePerLinkageWeight * m_directLinkageWeights[branch][node];
+    }
+    solver.transformStatic2DSensitivityRhs(rightHandSides, branches);
+    result.diagnostics.rhsConstructionMs = elapsedMs(rhsStarted);
+
+    const auto retained = m_backend->solveRetainedFactorization(
+        rightHandSides, branches);
+    result.diagnostics.hostToDeviceMs = retained.hostToDeviceMs;
+    result.diagnostics.multiRhsSolveMs = retained.solveMs;
+    result.diagnostics.deviceToHostMs = retained.deviceToHostMs;
+    result.diagnostics.linearSolveCalls = retained.solveCalls;
+    result.diagnostics.reusedFactorization = retained.reusedFactorization;
+
+    const auto projectionStarted = Clock::now();
+    const double outputScale = 4.0 * PI * 1.e-5;
+    result.differentialLinkageH.assign(
+        branches, std::vector<double>(branches, 0.0));
+    for (std::size_t input = 0; input < branches; ++input)
+        for (std::size_t output = 0; output < branches; ++output)
+            for (std::size_t node = 0; node < nodes; ++node)
+                result.differentialLinkageH[output][input] +=
+                    m_directLinkageWeights[output][node] * outputScale *
+                    retained.solutions[input * nodes + node];
+    result.diagnostics.linkageProjectionMs = elapsedMs(projectionStarted);
+    result.diagnostics.totalMs = elapsedMs(totalStarted);
+    return result;
 }
 
 TrialSolution PersistentMotorSession::evaluateTrial(

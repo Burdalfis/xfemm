@@ -55,6 +55,7 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
 {
 
     lastNewtonIterations = 0;
+    lastNewtonRelativeUpdate = 0;
     lastStaticSolveTimings = {};
 
     int i,j,k,w,s;
@@ -1067,6 +1068,7 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
     while(LinearFlag==false);
 
     lastNewtonIterations = Iter;
+    lastNewtonRelativeUpdate = res;
 
     for(i = 0; i<NumNodes; i++)
     {
@@ -1083,6 +1085,53 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
     }
 
     return true;
+}
+
+void FSolver::transformStatic2DSensitivityRhs(
+    std::vector<double> &rightHandSides,
+    std::size_t rightHandSideCount) const
+{
+    const std::size_t nodes = static_cast<std::size_t>(NumNodes);
+    if (rightHandSideCount == 0 ||
+        rightHandSides.size() != nodes * rightHandSideCount)
+        throw std::invalid_argument(
+            "Static2D sensitivity RHS dimensions disagree");
+
+    std::vector<bool> fixed(nodes, false);
+    for (int i = 0; i < NumNodes; ++i) {
+        const int marker = meshnode[static_cast<std::size_t>(i)].BoundaryMarker;
+        if (marker >= 0 && nodeproplist[static_cast<std::size_t>(marker)].J.re == 0 &&
+            nodeproplist[static_cast<std::size_t>(marker)].J.im == 0)
+            fixed[static_cast<std::size_t>(i)] = true;
+    }
+    for (int i = 0; i < NumEls; ++i) {
+        for (int edge = 0; edge < 3; ++edge) {
+            const int marker = meshele[static_cast<std::size_t>(i)].e[edge];
+            if (marker < 0 ||
+                lineproplist[static_cast<std::size_t>(marker)].BdryFormat != 0)
+                continue;
+            fixed[static_cast<std::size_t>(
+                meshele[static_cast<std::size_t>(i)].p[edge])] = true;
+            fixed[static_cast<std::size_t>(
+                meshele[static_cast<std::size_t>(i)].p[(edge + 1) % 3])] = true;
+        }
+    }
+    for (std::size_t column = 0; column < rightHandSideCount; ++column)
+        for (std::size_t node = 0; node < nodes; ++node)
+            if (fixed[node]) rightHandSides[column * nodes + node] = 0;
+
+    for (int boundary = 0; boundary < NumPBCs; ++boundary) {
+        const auto &pair = pbclist[static_cast<std::size_t>(boundary)];
+        const std::size_t first = static_cast<std::size_t>(pair.x);
+        const std::size_t second = static_cast<std::size_t>(pair.y);
+        const double sign = pair.t == 1 ? -1.0 : 1.0;
+        for (std::size_t column = 0; column < rightHandSideCount; ++column) {
+            double *rhs = rightHandSides.data() + column * nodes;
+            const double combined = 0.5 * (rhs[first] + sign * rhs[second]);
+            rhs[first] = combined;
+            rhs[second] = sign * combined;
+        }
+    }
 }
 
 //=========================================================================

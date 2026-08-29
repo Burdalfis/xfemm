@@ -243,7 +243,8 @@ class CudssContext {
 public:
     CudssContext(const HostCsr &matrix, const double *rhs, bool deterministic,
                  LinearSystemDiagnostics &diagnostics)
-        : m_rows(matrix.rows), m_columns(matrix.columns), m_values(matrix.values)
+        : m_rows(matrix.rows), m_columns(matrix.columns), m_values(matrix.values),
+          m_deterministic(deterministic)
     {
         const auto constructionStarted = Clock::now();
         m_dRows.allocate(m_rows.size());
@@ -345,6 +346,87 @@ public:
         diagnostics.factorizationRetained = true;
     }
 
+    RetainedFactorizationSolveReport solveRetained(
+        const std::vector<double> &rightHandSides,
+        std::size_t rightHandSideCount)
+    {
+        if (!m_factorized)
+            throw std::logic_error(
+                "cuDSS retained solve requires a factorized matrix");
+        const std::size_t dimension = m_rows.size() - 1;
+        if (rightHandSideCount == 0 ||
+            rightHandSides.size() != dimension * rightHandSideCount)
+            throw std::invalid_argument(
+                "cuDSS retained RHS dimensions disagree");
+
+        DeviceBuffer<double> deviceRhs(rightHandSides.size());
+        DeviceBuffer<double> deviceSolution(rightHandSides.size());
+        cudssMatrix_t rhs = nullptr;
+        cudssMatrix_t solution = nullptr;
+        RetainedFactorizationSolveReport report;
+        report.rightHandSides = rightHandSideCount;
+        report.solutions.resize(rightHandSides.size());
+        if (m_deterministic && rightHandSideCount > 1) {
+            for (std::size_t column = 0; column < rightHandSideCount; ++column) {
+                const double *hostRhs = rightHandSides.data() + column * dimension;
+                double *hostSolution = report.solutions.data() + column * dimension;
+                report.hostToDeviceMs += timeStream(m_stream, [&] {
+                    XFEMM_CUDA_CHECK(cudaMemcpyAsync(
+                        m_dRhs.get(), hostRhs, m_dRhs.bytes(),
+                        cudaMemcpyHostToDevice, m_stream));
+                });
+                report.solveMs += timeStream(m_stream, [&] {
+                    XFEMM_CUDSS_CHECK(cudssExecute(
+                        m_handle, CUDSS_PHASE_SOLVE, m_config, m_data, m_matrix,
+                        m_solution, m_rhs));
+                });
+                report.deviceToHostMs += timeStream(m_stream, [&] {
+                    XFEMM_CUDA_CHECK(cudaMemcpyAsync(
+                        hostSolution, m_dSolution.get(), m_dSolution.bytes(),
+                        cudaMemcpyDeviceToHost, m_stream));
+                });
+                ++report.solveCalls;
+            }
+            report.reusedFactorization = true;
+            return report;
+        }
+        try {
+            const std::int64_t rows = static_cast<std::int64_t>(dimension);
+            const std::int64_t columns =
+                static_cast<std::int64_t>(rightHandSideCount);
+            XFEMM_CUDSS_CHECK(cudssMatrixCreateDn(
+                &rhs, rows, columns, rows, deviceRhs.get(), CUDSS_R_64F,
+                CUDSS_LAYOUT_COL_MAJOR));
+            XFEMM_CUDSS_CHECK(cudssMatrixCreateDn(
+                &solution, rows, columns, rows, deviceSolution.get(),
+                CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR));
+            report.hostToDeviceMs = timeStream(m_stream, [&] {
+                XFEMM_CUDA_CHECK(cudaMemcpyAsync(
+                    deviceRhs.get(), rightHandSides.data(), deviceRhs.bytes(),
+                    cudaMemcpyHostToDevice, m_stream));
+            });
+            report.solveMs = timeStream(m_stream, [&] {
+                XFEMM_CUDSS_CHECK(cudssExecute(
+                    m_handle, CUDSS_PHASE_SOLVE, m_config, m_data, m_matrix,
+                    solution, rhs));
+            });
+            report.deviceToHostMs = timeStream(m_stream, [&] {
+                XFEMM_CUDA_CHECK(cudaMemcpyAsync(
+                    report.solutions.data(), deviceSolution.get(),
+                    deviceSolution.bytes(), cudaMemcpyDeviceToHost, m_stream));
+            });
+            cudssMatrixDestroy(solution);
+            cudssMatrixDestroy(rhs);
+            report.reusedFactorization = true;
+            report.solveCalls = 1;
+            return report;
+        } catch (...) {
+            if (solution) cudssMatrixDestroy(solution);
+            if (rhs) cudssMatrixDestroy(rhs);
+            throw;
+        }
+    }
+
     bool factorized() const { return m_factorized; }
 
 private:
@@ -391,6 +473,7 @@ private:
     std::array<std::int64_t, 16> m_memory{};
     bool m_structureUploaded = false;
     bool m_factorized = false;
+    bool m_deterministic = false;
 };
 
 } // namespace
@@ -503,6 +586,7 @@ public:
             diagnostics.bucketReused = true;
         }
         const auto switchStarted = Clock::now();
+        lastFactorization = nullptr;
         if (active)
             sessionSolution.assign(active->assembly->V,
                                    active->assembly->V + dimension);
@@ -538,6 +622,7 @@ public:
     ScalarView<double> scratch;
     ScalarView<int> flags;
     LinearSystemDiagnostics diagnostics;
+    CudssContext *lastFactorization = nullptr;
 };
 
 CudssLinearSystemBackend::CudssLinearSystemBackend(CudssBackendOptions options)
@@ -653,6 +738,7 @@ SolveReport CudssLinearSystemBackend::solve(const SolveOptions &options)
 
     context->solve(exact, bucket.assembly->b, bucket.assembly->V,
                    m_impl->diagnostics);
+    m_impl->lastFactorization = context;
     ++m_impl->diagnostics.linearSolves;
     m_impl->sessionSolution.assign(bucket.assembly->V,
                                    bucket.assembly->V + m_impl->dimension);
@@ -679,6 +765,18 @@ SolveReport CudssLinearSystemBackend::solve(const SolveOptions &options)
             " and stored triangular CSR NNZ " +
             std::to_string(exact.columns.size()));
     return report;
+}
+
+RetainedFactorizationSolveReport
+CudssLinearSystemBackend::solveRetainedFactorization(
+    const std::vector<double> &rightHandSides,
+    std::size_t rightHandSideCount)
+{
+    if (!m_impl->lastFactorization)
+        throw std::logic_error(
+            "cuDSS backend has no retained factorization for this bucket");
+    return m_impl->lastFactorization->solveRetained(
+        rightHandSides, rightHandSideCount);
 }
 
 void CudssLinearSystemBackend::reset_diagnostics()

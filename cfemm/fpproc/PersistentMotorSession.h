@@ -13,6 +13,25 @@ class FPProc;
 
 namespace femm {
 
+struct MagneticTangentDiagnostics {
+    double rhsConstructionMs = 0;
+    double hostToDeviceMs = 0;
+    double multiRhsSolveMs = 0;
+    double deviceToHostMs = 0;
+    double linkageProjectionMs = 0;
+    double totalMs = 0;
+    double finalNewtonRelativeUpdate = 0;
+    std::size_t branchCount = 0;
+    std::size_t linearSolveCalls = 0;
+    bool reusedFactorization = false;
+};
+
+struct MagneticTangentResult {
+    /** Row = linkage branch, column = independently prescribed-current branch. */
+    std::vector<std::vector<double>> differentialLinkageH;
+    MagneticTangentDiagnostics diagnostics;
+};
+
 /**
  * Persistent, in-memory magnetic evaluator.
  *
@@ -58,6 +77,11 @@ public:
 
     /** Add accepted-state or full diagnostics to the latest live trial. */
     void completeTrial(TrialSolution &trial, PhysicalResultLevel level);
+
+    /** Extract d(lambda)/d(i) for the latest live trial from the retained
+     * converged magnetic Newton tangent. No nonlinear field evaluation or
+     * numeric refactorization is performed. */
+    MagneticTangentResult extractTrialTangent();
 
     /**
      * Three-phase convenience interface moving toward

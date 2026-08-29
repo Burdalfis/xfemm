@@ -293,6 +293,90 @@ int main(int argc, char **argv)
             if (!gapResult.harmonics.empty())
                 return fail("accepted-state promotion packaged diagnostic harmonics");
         gpu.commitTrial(residualOnly);
+
+        // The dynamic branch tangent must come from one retained magnetic
+        // factorization, not from additional nonlinear field evaluations.
+        const auto tangentBase = gpu.evaluateTrial(
+            femm::PhysicalResultLevel::ResidualOnly);
+        const auto tangent = gpu.extractTrialTangent();
+        if (tangent.differentialLinkageH.size() != 3 ||
+            tangent.diagnostics.branchCount != 3 ||
+            tangent.diagnostics.linearSolveCalls != 1 ||
+            !tangent.diagnostics.reusedFactorization ||
+            !(tangent.diagnostics.multiRhsSolveMs > 0))
+            return fail("retained magnetic tangent diagnostics are invalid");
+        constexpr double tangentStepA = 0.025;
+        std::array<double, 3> tangentBaseCurrents{};
+        for (std::size_t i = 0; i < 3; ++i)
+            tangentBaseCurrents[i] = tangentBase.real->circuits[i].current;
+        std::vector<std::vector<double>> finiteDifference(
+            3, std::vector<double>(3, 0.0));
+        for (std::size_t column = 0; column < 3; ++column) {
+            auto setPerturbation = [&](double perturbation) {
+                gpu.analysis().updateSolveParameters(
+                    [&](femm::SolveParameters &parameters) {
+                        for (std::size_t i = 0; i < 3; ++i)
+                            parameters.circuitConstraints[femm::CircuitId{i}] = {
+                                femm::CircuitConstraintKind::PrescribedCurrent,
+                                CComplex(tangentBaseCurrents[i] +
+                                    (i == column ? perturbation : 0.0), 0)};
+                    });
+                return gpu.evaluateTrial(femm::PhysicalResultLevel::ResidualOnly);
+            };
+            const auto positive = setPerturbation(tangentStepA);
+            const auto negative = setPerturbation(-tangentStepA);
+            for (std::size_t row = 0; row < 3; ++row)
+                finiteDifference[row][column] =
+                    (positive.real->circuits[row].fluxLinkage -
+                     negative.real->circuits[row].fluxLinkage) /
+                    (2.0 * tangentStepA);
+        }
+        double tangentMaximumError = 0;
+        double tangentScale = 0;
+        double tangentAntisymmetry = 0;
+        for (std::size_t row = 0; row < 3; ++row) {
+            if (tangent.differentialLinkageH[row].size() != 3)
+                return fail("magnetic tangent matrix is not square");
+            for (std::size_t column = 0; column < 3; ++column) {
+                tangentMaximumError = std::max(
+                    tangentMaximumError,
+                    std::abs(tangent.differentialLinkageH[row][column] -
+                             finiteDifference[row][column]));
+                tangentScale = std::max(
+                    tangentScale, std::abs(finiteDifference[row][column]));
+                tangentAntisymmetry = std::max(
+                    tangentAntisymmetry,
+                    std::abs(tangent.differentialLinkageH[row][column] -
+                             tangent.differentialLinkageH[column][row]));
+            }
+        }
+        std::cout << std::setprecision(17)
+                  << "persistent_session_tangent"
+                  << " max_abs_error_H=" << tangentMaximumError
+                  << " max_relative_error=" << tangentMaximumError / tangentScale
+                  << " antisymmetry_H=" << tangentAntisymmetry
+                  << " rhs_ms=" << tangent.diagnostics.rhsConstructionMs
+                  << " solve_ms=" << tangent.diagnostics.multiRhsSolveMs
+                  << " projection_ms="
+                  << tangent.diagnostics.linkageProjectionMs
+                  << " total_ms=" << tangent.diagnostics.totalMs
+                  << " final_magnetic_update="
+                  << tangent.diagnostics.finalNewtonRelativeUpdate << '\n';
+        if (tangentMaximumError > 5e-9 + 5e-3 * tangentScale)
+            return fail("retained magnetic tangent disagrees with centered FD");
+        if (tangentAntisymmetry > 1e-10 + 1e-5 * tangentScale)
+            return fail("retained magnetic tangent violates reciprocity");
+        gpu.analysis().updateSolveParameters(
+            [&](femm::SolveParameters &parameters) {
+                for (std::size_t i = 0; i < 3; ++i)
+                    parameters.circuitConstraints[femm::CircuitId{i}] = {
+                        femm::CircuitConstraintKind::PrescribedCurrent,
+                        CComplex(tangentBaseCurrents[i], 0)};
+            });
+        const auto tangentRestored = gpu.evaluateTrial(
+            femm::PhysicalResultLevel::ResidualOnly);
+        gpu.commitTrial(tangentRestored);
+
         const auto initialAngles = gpu.analysis().solveParameters().airGapPositions;
         const auto gap = initialAngles.begin()->first;
         const double originalInner = initialAngles.begin()->second.innerAngle;
