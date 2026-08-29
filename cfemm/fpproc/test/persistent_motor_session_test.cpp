@@ -1,6 +1,7 @@
 #include "PersistentMotorSession.h"
 
 #include "FemmReader.h"
+#include "MesherBackend.h"
 #include "linsolve/CudssLinearSystemBackend.h"
 
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -78,6 +80,26 @@ int fail(const std::string &message)
     return 1;
 }
 
+class FixedMeshBackend final : public fmesher::MesherBackend {
+public:
+    explicit FixedMeshBackend(femm::mesh::SolverMesh mesh)
+        : m_mesh(std::move(mesh))
+    {}
+
+    femm::mesh::MeshResult mesh(
+        femm::FemmProblem &, bool,
+        const femm::mesh::MeshingOptions &) override
+    {
+        femm::mesh::MeshResult result;
+        result.status = femm::mesh::MeshStatus::Success;
+        result.mesh = m_mesh;
+        return result;
+    }
+
+private:
+    femm::mesh::SolverMesh m_mesh;
+};
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -96,6 +118,13 @@ int main(int argc, char **argv)
             femm::CudssSessionOptions{1.2, false, false, 2});
 
         gpu.initialize();
+        if (!gpu.analysis().mesh())
+            return fail("cuDSS session did not retain its generated mesh");
+        // The CPU and GPU backends are the quantities under test, not two
+        // independent Tangle runs. Reuse the exact immutable mesh so the
+        // nodal parity oracle has identical dimensions and ordering.
+        cpu.analysis().setMesher(std::make_shared<FixedMeshBackend>(
+            *gpu.analysis().mesh()));
         const auto initialization = gpu.initializationDiagnostics();
         if (initialization.sessionInitializationMs <= 0 ||
             initialization.bucketConstructionMs <= 0 ||
@@ -268,13 +297,26 @@ int main(int argc, char **argv)
         const auto gap = initialAngles.begin()->first;
         const double originalInner = initialAngles.begin()->second.innerAngle;
         const double originalOuter = initialAngles.begin()->second.outerAngle;
-        gpu.analysis().setAirGapAngle(gap, originalInner + 0.1, originalOuter);
+        // The fixture starts only 0.1 degree below the next 1.2-degree bucket;
+        // keep this explicit same-bucket check safely on the original side.
+        gpu.analysis().setAirGapAngle(gap, originalInner + 0.02, originalOuter);
         const auto rejected = gpu.evaluateTrial();
         if (!rejected.real || rejected.diagnostics.exactTopologyFallback ||
             rejected.diagnostics.symbolicAnalysisMs != 0 ||
             rejected.diagnostics.bucketConstructionMs != 0 ||
-            rejected.diagnostics.bucketIdentity != gpuTrial.diagnostics.bucketIdentity)
-            return fail("same-bucket transient trial did not use the immutable union");
+            rejected.diagnostics.bucketIdentity != gpuTrial.diagnostics.bucketIdentity) {
+            std::ostringstream message;
+            message << "same-bucket transient trial did not use the immutable union"
+                    << " initial_bucket=" << gpuTrial.diagnostics.bucketIdentity
+                    << " trial_bucket=" << rejected.diagnostics.bucketIdentity
+                    << " exact_fallback="
+                    << rejected.diagnostics.exactTopologyFallback
+                    << " symbolic_ms="
+                    << rejected.diagnostics.symbolicAnalysisMs
+                    << " bucket_construction_ms="
+                    << rejected.diagnostics.bucketConstructionMs;
+            return fail(message.str());
+        }
         const double rejectedDifference = relativeVectorError(
             gpuTrial.real->nodal.magneticVectorPotential,
             rejected.real->nodal.magneticVectorPotential);
