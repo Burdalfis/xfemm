@@ -96,7 +96,8 @@ void printProfile(const std::string &phase, std::size_t index, double angle,
 
 femm::TrialSolution evaluateOuterAngle(
     femm::PersistentMotorSession &session, double outerAngle,
-    const std::array<double, 3> &currents)
+    const std::array<double, 3> &currents,
+    femm::PhysicalResultLevel level = femm::PhysicalResultLevel::FullDiagnostics)
 {
     session.analysis().updateSolveParameters([&](femm::SolveParameters &parameters) {
         for (std::size_t i = 0; i < currents.size(); ++i)
@@ -106,7 +107,15 @@ femm::TrialSolution evaluateOuterAngle(
         for (auto &gap : parameters.airGapPositions)
             gap.second.outerAngle = outerAngle;
     });
-    return session.evaluateTrial();
+    return session.evaluateTrial(level);
+}
+
+femm::PhysicalResultLevel parseResultLevel(const std::string &name)
+{
+    if (name == "residual") return femm::PhysicalResultLevel::ResidualOnly;
+    if (name == "accepted") return femm::PhysicalResultLevel::AcceptedState;
+    if (name == "full") return femm::PhysicalResultLevel::FullDiagnostics;
+    throw std::invalid_argument("evaluation level must be residual, accepted, or full");
 }
 
 void printPhysical(const std::string &phase, const femm::TrialSolution &result)
@@ -215,14 +224,18 @@ void printHotSummary(const std::vector<femm::EvaluationDiagnostics> &samples)
 
 int main(int argc, char **argv)
 {
-    if (argc != 2 && argc != 3) {
-        std::cerr << "expected a sliding-AGE motor .fem path and optional bucket width\n";
+    if (argc < 2 || argc > 4) {
+        std::cerr << "expected a sliding-AGE motor .fem path, optional bucket "
+                     "width, and optional residual|accepted|full level\n";
         return 2;
     }
     try {
         const bool legacyReference = argc == 3 && std::string(argv[2]) == "legacy";
-        const double bucketWidth = argc == 3 && !legacyReference
+        const double bucketWidth = argc >= 3 && !legacyReference
             ? std::stod(argv[2]) : 1.2;
+        const auto resultLevel = argc == 4
+            ? parseResultLevel(argv[3])
+            : femm::PhysicalResultLevel::FullDiagnostics;
         if (legacyReference) {
             femm::PersistentMotorSession reference{
                 femm::ModelDefinition(loadProblem(argv[1]))};
@@ -269,7 +282,8 @@ int main(int argc, char **argv)
         printProfile("initialization", 0, originalAngle,
                      session.initializationDiagnostics());
 
-        auto baseline = evaluateOuterAngle(session, originalAngle, baseCurrents);
+        auto baseline = evaluateOuterAngle(
+            session, originalAngle, baseCurrents, resultLevel);
         const std::size_t nodes =
             baseline.real->nodal.magneticVectorPotential.size();
         const std::size_t storedNonzeros = baseline.diagnostics.matrixNonzeros;
@@ -294,7 +308,8 @@ int main(int argc, char **argv)
             for (std::size_t c = 0; c < currents.size(); ++c)
                 currents[c] = baseCurrents[c] +
                     0.25 * std::sin(phase - twoPi * static_cast<double>(c) / 3.0);
-            auto trial = evaluateOuterAngle(session, angle, currents);
+            auto trial = evaluateOuterAngle(
+                session, angle, currents, resultLevel);
             printProfile("transient_hot", i, angle, trial.diagnostics);
             hotSamples.push_back(trial.diagnostics);
             session.commitTrial(trial);
@@ -302,12 +317,14 @@ int main(int argc, char **argv)
         printHotSummary(hotSamples);
 
         const double switchedAngle = originalAngle + 0.25;
-        auto switched = evaluateOuterAngle(session, switchedAngle, currents);
+        auto switched = evaluateOuterAngle(
+            session, switchedAngle, currents, resultLevel);
         printProfile("new_bucket", 0, switchedAngle, switched.diagnostics);
         session.commitTrial(switched);
 
         const double returnAngle = originalAngle + 0.08;
-        auto returned = evaluateOuterAngle(session, returnAngle, currents);
+        auto returned = evaluateOuterAngle(
+            session, returnAngle, currents, resultLevel);
         printProfile("cached_bucket_return", 0, returnAngle, returned.diagnostics);
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';

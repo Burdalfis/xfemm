@@ -1493,7 +1493,7 @@ bool FPProc::OpenDocument(string pathname)
     return finalizeSolution();
 }
 
-bool FPProc::finalizeSolution(bool initializeTopology)
+bool FPProc::finalizeSolution(bool initializeTopology, bool updateVolumeFields)
 {
     int i, j, k;
     double b, bi, br;
@@ -1733,7 +1733,8 @@ bool FPProc::finalizeSolution(bool initializeTopology)
     // from the initial import.
     if (!initializeTopology)
     {
-        for (i=0; i<(int)meshelem.size(); i++) GetElementB(meshelem[i]);
+        if (updateVolumeFields)
+            for (i=0; i<(int)meshelem.size(); i++) GetElementB(meshelem[i]);
         return true;
     }
 

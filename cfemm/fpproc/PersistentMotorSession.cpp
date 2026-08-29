@@ -1,8 +1,11 @@
 #include "PersistentMotorSession.h"
 
 #include "fpproc.h"
+#include "femmenums.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <stdexcept>
 
 namespace femm {
@@ -13,6 +16,22 @@ using Clock = std::chrono::steady_clock;
 double elapsedMs(Clock::time_point start)
 {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+
+bool atLeast(PhysicalResultLevel lhs, PhysicalResultLevel rhs)
+{
+    return static_cast<int>(lhs) >= static_cast<int>(rhs);
+}
+
+double solverElementAreaM2(const FSolver &solver,
+                           const femmsolver::CMElement &element)
+{
+    const auto &n0 = solver.meshnode[static_cast<std::size_t>(element.p[0])];
+    const auto &n1 = solver.meshnode[static_cast<std::size_t>(element.p[1])];
+    const auto &n2 = solver.meshnode[static_cast<std::size_t>(element.p[2])];
+    // FSolver mesh coordinates are centimetres.
+    return 0.0001 * std::abs((n1.x - n0.x) * (n2.y - n0.y) -
+                             (n2.x - n0.x) * (n1.y - n0.y)) / 2.0;
 }
 
 std::optional<CComplex> strandedSeriesFluxLinkage(
@@ -64,6 +83,7 @@ void PersistentMotorSession::initialize()
     if (m_backend->solveCount() != 0) {
         const auto physicalViewStarted = Clock::now();
         initializePhysicalView();
+        initializeDirectLinkageExtractor();
         m_initializationDiagnostics.serializationPostprocessorMs +=
             elapsedMs(physicalViewStarted);
     }
@@ -84,27 +104,148 @@ void PersistentMotorSession::initializePhysicalView()
     m_physicalViewInitialized = true;
 }
 
-TrialSolution PersistentMotorSession::evaluateTrial()
+void PersistentMotorSession::initializeDirectLinkageExtractor()
+{
+    if (m_directLinkageInitialized)
+        return;
+    m_directLinkageInitialized = true;
+
+    const auto &problem = m_session.model().problem();
+    const auto &solver = m_backend->solvedSolver();
+    const std::size_t circuits = problem.circproplist.size();
+    if (solver.Frequency != 0 || problem.problemType != PLANAR ||
+        circuits != static_cast<std::size_t>(solver.NumCircPropsOrig))
+        return;
+    for (const auto &property : problem.circproplist) {
+        const auto *circuit = dynamic_cast<const CMCircuit *>(property.get());
+        if (!circuit || circuit->CircType != 1)
+            return;
+    }
+
+    std::vector<double> labelArea(solver.labellist.size(), 0.0);
+    for (const auto &element : solver.meshele) {
+        if (element.lbl >= 0 &&
+            element.lbl < static_cast<int>(labelArea.size()))
+            labelArea[static_cast<std::size_t>(element.lbl)] +=
+                solverElementAreaM2(solver, element);
+    }
+
+    const double depth = problem.Depth == -1
+        ? 1.0
+        : problem.Depth * LengthConvMeters[problem.LengthUnits];
+    m_directLinkageWeights.assign(
+        circuits, std::vector<double>(solver.meshnode.size(), 0.0));
+    std::vector<bool> found(circuits, false);
+    for (const auto &element : solver.meshele) {
+        if (element.lbl < 0 ||
+            element.lbl >= static_cast<int>(solver.labellist.size()))
+            continue;
+        const std::size_t label = static_cast<std::size_t>(element.lbl);
+        const int privateCircuit = solver.labellist[label].InCircuit;
+        if (privateCircuit < 0 ||
+            privateCircuit >= static_cast<int>(solver.circproplist.size()))
+            continue;
+        const int originalCircuit = solver.circproplist[
+            static_cast<std::size_t>(privateCircuit)].OrigCirc;
+        if (originalCircuit < 0 ||
+            originalCircuit >= static_cast<int>(circuits) ||
+            !(labelArea[label] > 0))
+            continue;
+        found[static_cast<std::size_t>(originalCircuit)] = true;
+        const double coefficient =
+            static_cast<double>(solver.labellist[label].Turns) * depth *
+            solverElementAreaM2(solver, element) / (3.0 * labelArea[label]);
+        auto &weights = m_directLinkageWeights[
+            static_cast<std::size_t>(originalCircuit)];
+        for (int node : element.p)
+            weights[static_cast<std::size_t>(node)] += coefficient;
+    }
+    if (!std::all_of(found.begin(), found.end(), [](bool value) { return value; })) {
+        m_directLinkageWeights.clear();
+        return;
+    }
+    m_directLinkageAvailable = true;
+}
+
+void PersistentMotorSession::refreshPhysicalView(bool airGapOnly)
+{
+    if (!m_physicalViewInitialized) {
+        initializePhysicalView();
+        return;
+    }
+    const bool updated = airGapOnly
+        ? m_postProcessor->UpdateAirGapSolution(m_backend->solvedSolver(),
+                                                m_backend->solvedSystem())
+        : m_postProcessor->UpdateSolution(m_backend->solvedSolver(),
+                                          m_backend->solvedSystem());
+    if (!updated)
+        throw std::runtime_error("could not refresh persistent magnetic physical view");
+}
+
+TrialSolution PersistentMotorSession::evaluateTrial(PhysicalResultLevel level)
 {
     const auto totalStarted = Clock::now();
     TrialSolution trial = m_session.solve();
+    m_lastEvaluatedTrialId = trial.id;
     if (m_initialized)
         trial.diagnostics.sessionInitializationMs =
             m_initializationDiagnostics.sessionInitializationMs;
-    const auto updateStarted = Clock::now();
-    if (!m_physicalViewInitialized)
-        initializePhysicalView();
-    else if (!m_postProcessor->UpdateSolution(m_backend->solvedSolver(),
-                                               m_backend->solvedSystem()))
-        throw std::runtime_error("could not refresh persistent magnetic physical view");
-    trial.diagnostics.serializationPostprocessorMs += elapsedMs(updateStarted);
-    addPhysicalResults(trial);
+    initializeDirectLinkageExtractor();
+
+    const bool needsFullView =
+        level == PhysicalResultLevel::FullDiagnostics ||
+        !m_directLinkageAvailable;
+    if (needsFullView) {
+        const auto updateStarted = Clock::now();
+        refreshPhysicalView(false);
+        trial.diagnostics.serializationPostprocessorMs += elapsedMs(updateStarted);
+    }
+    addLinkageResults(trial, level == PhysicalResultLevel::FullDiagnostics);
+    if (atLeast(level, PhysicalResultLevel::AcceptedState)) {
+        if (!needsFullView) {
+            const auto updateStarted = Clock::now();
+            refreshPhysicalView(true);
+            trial.diagnostics.serializationPostprocessorMs += elapsedMs(updateStarted);
+        }
+        addAcceptedStateResults(
+            trial, level == PhysicalResultLevel::FullDiagnostics);
+    }
+    if (level == PhysicalResultLevel::FullDiagnostics)
+        addFullDiagnosticResults(trial);
+    trial.real->physicalResultLevel = level;
     trial.diagnostics.totalEvaluateMs = elapsedMs(totalStarted);
     return trial;
 }
 
+void PersistentMotorSession::completeTrial(TrialSolution &trial,
+                                           PhysicalResultLevel level)
+{
+    if (!trial.real)
+        throw std::logic_error("persistent motor evaluator requires a real solution");
+    if (trial.id != m_lastEvaluatedTrialId)
+        throw std::logic_error("only the latest live magnetic trial can be completed");
+    const PhysicalResultLevel current = trial.real->physicalResultLevel;
+    if (atLeast(current, level))
+        return;
+
+    const auto completionStarted = Clock::now();
+    const auto updateStarted = Clock::now();
+    refreshPhysicalView(level == PhysicalResultLevel::AcceptedState);
+    trial.diagnostics.serializationPostprocessorMs += elapsedMs(updateStarted);
+    if (level == PhysicalResultLevel::FullDiagnostics) {
+        addLinkageResults(trial, true);
+        addAcceptedStateResults(trial, true);
+        addFullDiagnosticResults(trial);
+    } else {
+        addAcceptedStateResults(trial, false);
+    }
+    trial.real->physicalResultLevel = level;
+    trial.diagnostics.totalEvaluateMs += elapsedMs(completionStarted);
+}
+
 TrialSolution PersistentMotorSession::evaluateTrial(
-    double thetaMechanical, const std::array<double, 3> &currents)
+    double thetaMechanical, const std::array<double, 3> &currents,
+    PhysicalResultLevel level)
 {
     if (m_session.model().problem().circproplist.size() != currents.size())
         throw std::invalid_argument(
@@ -116,29 +257,64 @@ TrialSolution PersistentMotorSession::evaluateTrial(
         for (auto &gap : parameters.airGapPositions)
             gap.second.innerAngle = thetaMechanical;
     });
-    return evaluateTrial();
+    return evaluateTrial(level);
 }
 
-void PersistentMotorSession::addPhysicalResults(TrialSolution &trial)
+void PersistentMotorSession::addLinkageResults(
+    TrialSolution &trial, bool validateWithPostProcessor)
 {
     if (!trial.real)
         throw std::logic_error("persistent motor evaluator requires a real solution");
+    if (m_directLinkageAvailable &&
+        m_directLinkageWeights.size() != trial.real->circuits.size())
+        throw std::logic_error("direct linkage circuit count changed");
 
     const auto fluxStarted = Clock::now();
     for (std::size_t i = 0; i < trial.real->circuits.size(); ++i) {
-        const CComplex conventional = m_postProcessor->GetFluxLinkage(
-            static_cast<int>(i));
-        const auto stranded = strandedSeriesFluxLinkage(
-            *m_postProcessor, static_cast<int>(i));
-        const CComplex linkage = stranded.value_or(conventional);
-        trial.real->circuits[i].fluxLinkage = linkage.re;
-        trial.real->circuits[i].conventionalFluxLinkage = conventional.re;
-        if (stranded)
-            trial.real->circuits[i].strandedFluxLinkage = stranded->re;
-        trial.circuits[i].fluxLinkage = linkage;
+        double linkage = 0;
+        if (m_directLinkageAvailable) {
+            const auto &weights = m_directLinkageWeights[i];
+            const auto &solution = m_backend->solvedSystem().rhs();
+            if (weights.size() != solution.size())
+                throw std::logic_error("direct linkage solution dimension changed");
+            for (std::size_t node = 0; node < weights.size(); ++node)
+                linkage += weights[node] * solution[node];
+            trial.real->circuits[i].strandedFluxLinkage = linkage;
+        } else {
+            const CComplex conventional = m_postProcessor->GetFluxLinkage(
+                static_cast<int>(i));
+            const auto stranded = strandedSeriesFluxLinkage(
+                *m_postProcessor, static_cast<int>(i));
+            linkage = stranded.value_or(conventional).re;
+            trial.real->circuits[i].conventionalFluxLinkage = conventional.re;
+            if (stranded)
+                trial.real->circuits[i].strandedFluxLinkage = stranded->re;
+        }
+        if (validateWithPostProcessor) {
+            const CComplex conventional = m_postProcessor->GetFluxLinkage(
+                static_cast<int>(i));
+            trial.real->circuits[i].conventionalFluxLinkage = conventional.re;
+            const auto reference = strandedSeriesFluxLinkage(
+                *m_postProcessor, static_cast<int>(i));
+            if (reference) {
+                const double tolerance = 1e-13 + 1e-10 *
+                    std::max(std::abs(linkage), std::abs(reference->re));
+                if (std::abs(linkage - reference->re) > tolerance)
+                    throw std::runtime_error(
+                        "direct stranded-series linkage disagrees with FPProc");
+            }
+        }
+        trial.real->circuits[i].fluxLinkage = linkage;
+        trial.circuits[i].fluxLinkage = CComplex(linkage, 0);
     }
-    trial.diagnostics.fluxLinkageMs = elapsedMs(fluxStarted);
+    trial.diagnostics.fluxLinkageMs += elapsedMs(fluxStarted);
+}
 
+void PersistentMotorSession::addAcceptedStateResults(
+    TrialSolution &trial, bool packageHarmonics)
+{
+    if (!trial.real)
+        throw std::logic_error("persistent motor evaluator requires a real solution");
     trial.real->airGaps.clear();
     trial.real->torque = 0;
     trial.real->airGaps.reserve(m_postProcessor->agelist.size());
@@ -151,17 +327,24 @@ void PersistentMotorSession::addPhysicalResults(TrialSolution &trial)
             FPProcError::NoError)
             throw std::runtime_error("could not calculate AGE torque for " + gap.BdryName);
         trial.diagnostics.torqueMs += elapsedMs(torqueStarted);
-        const auto harmonicStarted = Clock::now();
-        result.harmonics.reserve(static_cast<std::size_t>(gap.nn));
-        for (int i = 0; i < gap.nn; ++i)
-            result.harmonics.push_back({gap.nh[i], gap.brc[i], gap.brs[i],
-                                        gap.btc[i], gap.bts[i]});
-        trial.diagnostics.airGapHarmonicPackagingMs +=
-            elapsedMs(harmonicStarted);
+        if (packageHarmonics) {
+            const auto harmonicStarted = Clock::now();
+            result.harmonics.reserve(static_cast<std::size_t>(gap.nn));
+            for (int i = 0; i < gap.nn; ++i)
+                result.harmonics.push_back({gap.nh[i], gap.brc[i], gap.brs[i],
+                                            gap.btc[i], gap.bts[i]});
+            trial.diagnostics.airGapHarmonicPackagingMs +=
+                elapsedMs(harmonicStarted);
+        }
         trial.real->torque += result.torque;
         trial.real->airGaps.push_back(std::move(result));
     }
+}
 
+void PersistentMotorSession::addFullDiagnosticResults(TrialSolution &trial)
+{
+    if (!trial.real)
+        throw std::logic_error("persistent motor evaluator requires a real solution");
     const auto energyStarted = Clock::now();
     std::vector<bool> selected;
     selected.reserve(m_postProcessor->blocklist.size());
@@ -183,7 +366,7 @@ void PersistentMotorSession::addPhysicalResults(TrialSolution &trial)
     }
     for (std::size_t i = 0; i < selected.size(); ++i)
         m_postProcessor->blocklist[i].IsSelected = selected[i];
-    trial.diagnostics.energyCoenergyMs = elapsedMs(energyStarted);
+    trial.diagnostics.energyCoenergyMs += elapsedMs(energyStarted);
 }
 
 std::shared_ptr<const AcceptedState>
@@ -195,10 +378,8 @@ PersistentMotorSession::commitTrial(const TrialSolution &trial)
 void PersistentMotorSession::rollbackToCommitted()
 {
     m_session.rollbackToCommitted();
-    if (m_physicalViewInitialized &&
-        !m_postProcessor->UpdateSolution(m_backend->solvedSolver(),
-                                         m_backend->solvedSystem()))
-        throw std::runtime_error("could not restore committed physical state");
+    // The backend owns the authoritative committed/trial magnetic state. The
+    // physical view is refreshed explicitly by the next accepted/full result.
 }
 
 } // namespace femm

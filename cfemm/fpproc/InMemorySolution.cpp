@@ -231,3 +231,28 @@ bool FPProc::UpdateSolution(const FSolver &solver,
     copyPhysicalCircuitState(solver, labelMapping, blocklist);
     return finalizeSolution(false);
 }
+
+bool FPProc::UpdateAirGapSolution(
+    const FSolver &solver,
+    const femm::LinearSystemBackend<double> &solution)
+{
+    if (solution.dimension() != solver.NumNodes ||
+        meshnode.size() != solver.meshnode.size())
+        throw std::invalid_argument("persistent postprocessor topology changed");
+
+    Frequency = solver.Frequency;
+    Precision = solver.Precision;
+    for (std::size_t i = 0; i < meshnode.size(); ++i)
+        meshnode[i].A = solution.rhs()[i];
+
+    for (auto &age : agelist) releaseAirGapFields(age);
+    agelist = solver.agelist;
+    for (auto &age : agelist) {
+        clearAirGapFieldPointers(age);
+        age.ri /= 100.;
+        age.ro /= 100.;
+        age.agc /= 100.;
+    }
+    NumAirGapElems = static_cast<int>(agelist.size());
+    return finalizeSolution(false, false);
+}

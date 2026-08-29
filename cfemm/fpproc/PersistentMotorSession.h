@@ -5,6 +5,7 @@
 #include "FSolverAnalysisBackend.h"
 
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -47,8 +48,16 @@ public:
     const EvaluationDiagnostics &initializationDiagnostics() const
     { return m_initializationDiagnostics; }
 
-    /** Evaluate the currently configured angle/circuit state as a trial. */
-    TrialSolution evaluateTrial();
+    /**
+     * Evaluate the currently configured angle/circuit state as a trial.
+     * FullDiagnostics is the compatibility default; nonlinear electrical
+     * solvers should request ResidualOnly and promote only converged states.
+     */
+    TrialSolution evaluateTrial(
+        PhysicalResultLevel level = PhysicalResultLevel::FullDiagnostics);
+
+    /** Add accepted-state or full diagnostics to the latest live trial. */
+    void completeTrial(TrialSolution &trial, PhysicalResultLevel level);
 
     /**
      * Three-phase convenience interface moving toward
@@ -56,20 +65,30 @@ public:
      * The model must contain exactly three circuits.
      */
     TrialSolution evaluateTrial(double thetaMechanical,
-                                const std::array<double, 3> &currents);
+                                const std::array<double, 3> &currents,
+                                PhysicalResultLevel level =
+                                    PhysicalResultLevel::FullDiagnostics);
 
     std::shared_ptr<const AcceptedState> commitTrial(const TrialSolution &trial);
     void rollbackToCommitted();
 
 private:
     void initializePhysicalView();
-    void addPhysicalResults(TrialSolution &trial);
+    void initializeDirectLinkageExtractor();
+    void refreshPhysicalView(bool airGapOnly);
+    void addLinkageResults(TrialSolution &trial, bool validateWithPostProcessor);
+    void addAcceptedStateResults(TrialSolution &trial, bool packageHarmonics);
+    void addFullDiagnosticResults(TrialSolution &trial);
 
     std::shared_ptr<FSolverAnalysisBackend> m_backend;
     AnalysisSession m_session;
     std::unique_ptr<FPProc> m_postProcessor;
     bool m_physicalViewInitialized = false;
+    bool m_directLinkageInitialized = false;
+    bool m_directLinkageAvailable = false;
     bool m_initialized = false;
+    std::uint64_t m_lastEvaluatedTrialId = 0;
+    std::vector<std::vector<double>> m_directLinkageWeights;
     EvaluationDiagnostics m_initializationDiagnostics;
 };
 

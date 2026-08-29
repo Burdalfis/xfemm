@@ -295,8 +295,17 @@ public:
      */
     bool UpdateSolution(const FSolver &solver,
                         const femm::LinearSystemBackend<double> &solution);
+    /**
+     * Refresh nodal A and AGE harmonic state without copying/recomputing
+     * volume-element post-processing fields. This is sufficient for AGE
+     * torque on an accepted persistent motor state.
+     */
+    bool UpdateAirGapSolution(
+        const FSolver &solver,
+        const femm::LinearSystemBackend<double> &solution);
     /** Prepare derived post-processing state after an in-memory solution import. */
-    bool finalizeSolution(bool initializeTopology = true);
+    bool finalizeSolution(bool initializeTopology = true,
+                          bool updateVolumeFields = true);
     /** Freeze the currently loaded solution (selection and contour state are excluded). */
     MagneticSolutionSnapshot solutionSnapshot() const;
     bool MakeMask();

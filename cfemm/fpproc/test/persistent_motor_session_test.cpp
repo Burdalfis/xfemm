@@ -150,6 +150,10 @@ int main(int argc, char **argv)
                   << " gpu_torque=" << gpuTrial.real->torque
                   << " torque_abs_error="
                   << std::abs(cpuReference.real->torque - gpuTrial.real->torque)
+                  << " cpu_nodes="
+                  << cpuReference.real->nodal.magneticVectorPotential.size()
+                  << " gpu_nodes="
+                  << gpuTrial.real->nodal.magneticVectorPotential.size()
                   << " nodal_relative_error=" << nodalError
                   << " nodal_max_error=" << nodalMaxError
                   << " gpu_relative_residual="
@@ -225,6 +229,41 @@ int main(int argc, char **argv)
         }
 
         gpu.commitTrial(gpuTrial);
+        const auto fullPostprocessorMs =
+            gpuTrial.diagnostics.serializationPostprocessorMs +
+            gpuTrial.diagnostics.energyCoenergyMs;
+        auto residualOnly = gpu.evaluateTrial(
+            femm::PhysicalResultLevel::ResidualOnly);
+        if (!residualOnly.real ||
+            residualOnly.real->physicalResultLevel !=
+                femm::PhysicalResultLevel::ResidualOnly ||
+            !residualOnly.real->airGaps.empty() ||
+            residualOnly.real->magneticFieldEnergyJ != 0 ||
+            residualOnly.real->magneticFieldCoenergyJ != 0 ||
+            residualOnly.diagnostics.energyCoenergyMs != 0)
+            return fail("residual-only evaluation performed accepted/full diagnostics");
+        for (std::size_t i = 0; i < 3; ++i)
+            if (!close(residualOnly.real->circuits[i].fluxLinkage,
+                       gpuTrial.real->circuits[i].fluxLinkage, 1e-10, 1e-13))
+                return fail("direct residual linkage changed validated semantics");
+        const double residualPostprocessorMs =
+            residualOnly.diagnostics.serializationPostprocessorMs +
+            residualOnly.diagnostics.energyCoenergyMs;
+        if (fullPostprocessorMs > 0 &&
+            residualPostprocessorMs >= fullPostprocessorMs)
+            return fail("residual-only evaluation did not skip full postprocessing");
+        gpu.completeTrial(residualOnly,
+                          femm::PhysicalResultLevel::AcceptedState);
+        if (residualOnly.real->physicalResultLevel !=
+                femm::PhysicalResultLevel::AcceptedState ||
+            residualOnly.real->airGaps.empty() ||
+            !close(residualOnly.real->torque, gpuTrial.real->torque,
+                   1e-10, 1e-12))
+            return fail("accepted-state promotion did not reproduce AGE torque");
+        for (const auto &gapResult : residualOnly.real->airGaps)
+            if (!gapResult.harmonics.empty())
+                return fail("accepted-state promotion packaged diagnostic harmonics");
+        gpu.commitTrial(residualOnly);
         const auto initialAngles = gpu.analysis().solveParameters().airGapPositions;
         const auto gap = initialAngles.begin()->first;
         const double originalInner = initialAngles.begin()->second.innerAngle;

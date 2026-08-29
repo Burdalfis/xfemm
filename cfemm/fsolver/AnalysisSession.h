@@ -175,6 +175,16 @@ struct RealAirGapResult {
     std::vector<RealAirGapHarmonic> harmonics;
 };
 
+/** Amount of physical post-processing requested for a solved magnetic trial. */
+enum class PhysicalResultLevel {
+    /** Circuit linkage only; sufficient to form an electrical residual. */
+    ResidualOnly = 0,
+    /** Circuit linkage and rotor torque for a converged integration stage. */
+    AcceptedState = 1,
+    /** Linkage, torque, AGE harmonics, and magnetic energy/coenergy. */
+    FullDiagnostics = 2,
+};
+
 /** Programmatically accessible timing and lifecycle data for one evaluate. */
 struct EvaluationDiagnostics {
     double sessionInitializationMs = 0;
@@ -240,6 +250,7 @@ struct RealTrialSolution {
     double torque = 0;
     double magneticFieldEnergyJ = 0;
     double magneticFieldCoenergyJ = 0;
+    PhysicalResultLevel physicalResultLevel = PhysicalResultLevel::ResidualOnly;
 };
 
 struct TrialSolution {
