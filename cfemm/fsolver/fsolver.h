@@ -65,6 +65,10 @@ public:
     {
         double nonlinearMaterialEvaluationMs = 0;
         double numericMatrixAssemblyMs = 0;
+        double airGapMatrixAssemblyMs = 0;
+        double elementMatrixAssemblyMs = 0;
+        double rhsConstructionMs = 0;
+        double boundaryConditionApplicationMs = 0;
         double nonlinearBookkeepingMs = 0;
     };
 

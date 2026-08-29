@@ -188,6 +188,14 @@ struct EvaluationDiagnostics {
     double airGapUpdateMs = 0;
     double nonlinearMaterialEvaluationMs = 0;
     double numericMatrixAssemblyMs = 0;
+    /** AGE numerical contributions within numericMatrixAssemblyMs. */
+    double airGapMatrixAssemblyMs = 0;
+    /** Volume-element numerical contributions within numericMatrixAssemblyMs. */
+    double elementMatrixAssemblyMs = 0;
+    /** Explicit nodal-source RHS work within numericMatrixAssemblyMs. */
+    double rhsConstructionMs = 0;
+    /** Dirichlet/periodic constraint work within numericMatrixAssemblyMs. */
+    double boundaryConditionApplicationMs = 0;
     double sparsePackingMs = 0;
     double hostToDeviceMs = 0;
     double numericFactorizationMs = 0;
@@ -198,6 +206,8 @@ struct EvaluationDiagnostics {
     double resultPackagingMs = 0;
     double fluxLinkageMs = 0;
     double torqueMs = 0;
+    double airGapHarmonicPackagingMs = 0;
+    double energyCoenergyMs = 0;
     double serializationPostprocessorMs = 0;
     double totalEvaluateMs = 0;
     std::uint64_t matrixNonzeros = 0;

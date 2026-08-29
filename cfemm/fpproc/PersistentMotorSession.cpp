@@ -139,7 +139,6 @@ void PersistentMotorSession::addPhysicalResults(TrialSolution &trial)
     }
     trial.diagnostics.fluxLinkageMs = elapsedMs(fluxStarted);
 
-    const auto torqueStarted = Clock::now();
     trial.real->airGaps.clear();
     trial.real->torque = 0;
     trial.real->airGaps.reserve(m_postProcessor->agelist.size());
@@ -147,18 +146,23 @@ void PersistentMotorSession::addPhysicalResults(TrialSolution &trial)
         RealAirGapResult result;
         result.name = gap.BdryName;
         result.centerVectorPotential = gap.aco;
+        const auto torqueStarted = Clock::now();
         if (m_postProcessor->gapDCTorqueIntegral(gap.BdryName, result.torque) !=
             FPProcError::NoError)
             throw std::runtime_error("could not calculate AGE torque for " + gap.BdryName);
+        trial.diagnostics.torqueMs += elapsedMs(torqueStarted);
+        const auto harmonicStarted = Clock::now();
         result.harmonics.reserve(static_cast<std::size_t>(gap.nn));
         for (int i = 0; i < gap.nn; ++i)
             result.harmonics.push_back({gap.nh[i], gap.brc[i], gap.brs[i],
                                         gap.btc[i], gap.bts[i]});
+        trial.diagnostics.airGapHarmonicPackagingMs +=
+            elapsedMs(harmonicStarted);
         trial.real->torque += result.torque;
         trial.real->airGaps.push_back(std::move(result));
     }
-    trial.diagnostics.torqueMs = elapsedMs(torqueStarted);
 
+    const auto energyStarted = Clock::now();
     std::vector<bool> selected;
     selected.reserve(m_postProcessor->blocklist.size());
     for (auto &label : m_postProcessor->blocklist) {
@@ -179,6 +183,7 @@ void PersistentMotorSession::addPhysicalResults(TrialSolution &trial)
     }
     for (std::size_t i = 0; i < selected.size(); ++i)
         m_postProcessor->blocklist[i].IsSelected = selected[i];
+    trial.diagnostics.energyCoenergyMs = elapsedMs(energyStarted);
 }
 
 std::shared_ptr<const AcceptedState>

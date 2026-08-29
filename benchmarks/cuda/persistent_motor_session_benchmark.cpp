@@ -42,7 +42,8 @@ double accountedMs(const femm::EvaluationDiagnostics &d)
            d.numericFactorizationMs + d.linearSolveMs + d.deviceToHostMs +
            d.residualEvaluationMs + d.nonlinearBookkeepingMs +
            d.resultPackagingMs + d.serializationPostprocessorMs +
-           d.fluxLinkageMs + d.torqueMs;
+           d.fluxLinkageMs + d.torqueMs +
+           d.airGapHarmonicPackagingMs + d.energyCoenergyMs;
 }
 
 void printHeader()
@@ -52,8 +53,11 @@ void printHeader()
            "model_prepare_ms,bucket_lookup_ms,bucket_switch_ms,"
            "bucket_definition_ms,bucket_resource_ms,symbolic_ms,age_update_ms,"
            "material_ms,matrix_assembly_ms,sparse_pack_scatter_ms,h2d_ms,"
+           "age_matrix_ms,element_matrix_and_rhs_ms,explicit_rhs_ms,"
+           "boundary_constraints_ms,"
            "factor_ms,solve_ms,d2h_ms,residual_ms,nonlinear_bookkeeping_ms,"
            "result_packaging_ms,postprocessor_update_ms,flux_ms,torque_ms,"
+           "age_harmonic_packaging_ms,energy_coenergy_ms,"
            "unaccounted_ms,newton_iterations,matrix_nonzeros,factor_nonzeros,"
            "permanent_device_bytes,peak_device_bytes,h2d_bytes,relative_residual,"
            "bucket_reused,symbolic_reused,exact_fallback,bucket_identity\n";
@@ -72,11 +76,16 @@ void printProfile(const std::string &phase, std::size_t index, double angle,
               << bucketResource << ',' << d.symbolicAnalysisMs << ','
               << d.airGapUpdateMs << ',' << d.nonlinearMaterialEvaluationMs << ','
               << d.numericMatrixAssemblyMs << ',' << d.sparsePackingMs << ','
-              << d.hostToDeviceMs << ',' << d.numericFactorizationMs << ','
+              << d.hostToDeviceMs << ',' << d.airGapMatrixAssemblyMs << ','
+              << d.elementMatrixAssemblyMs << ',' << d.rhsConstructionMs << ','
+              << d.boundaryConditionApplicationMs << ','
+              << d.numericFactorizationMs << ','
               << d.linearSolveMs << ',' << d.deviceToHostMs << ','
               << d.residualEvaluationMs << ',' << d.nonlinearBookkeepingMs << ','
               << d.resultPackagingMs << ',' << d.serializationPostprocessorMs << ','
-              << d.fluxLinkageMs << ',' << d.torqueMs << ',' << unaccounted << ','
+              << d.fluxLinkageMs << ',' << d.torqueMs << ','
+              << d.airGapHarmonicPackagingMs << ',' << d.energyCoenergyMs << ','
+              << unaccounted << ','
               << d.nonlinearIterations << ',' << d.matrixNonzeros << ','
               << d.factorNonzeros << ','
               << d.permanentDeviceBytes << ',' << d.peakDeviceBytes << ','
@@ -162,6 +171,14 @@ void printHotSummary(const std::vector<femm::EvaluationDiagnostics> &samples)
               << mean(samples, &femm::EvaluationDiagnostics::nonlinearMaterialEvaluationMs)
               << " matrix_assembly_mean_ms="
               << mean(samples, &femm::EvaluationDiagnostics::numericMatrixAssemblyMs)
+              << " age_matrix_mean_ms="
+              << mean(samples, &femm::EvaluationDiagnostics::airGapMatrixAssemblyMs)
+              << " element_matrix_and_rhs_mean_ms="
+              << mean(samples, &femm::EvaluationDiagnostics::elementMatrixAssemblyMs)
+              << " explicit_rhs_mean_ms="
+              << mean(samples, &femm::EvaluationDiagnostics::rhsConstructionMs)
+              << " boundary_constraints_mean_ms="
+              << mean(samples, &femm::EvaluationDiagnostics::boundaryConditionApplicationMs)
               << " sparse_pack_scatter_mean_ms="
               << mean(samples, &femm::EvaluationDiagnostics::sparsePackingMs)
               << " h2d_mean_ms="
@@ -184,6 +201,10 @@ void printHotSummary(const std::vector<femm::EvaluationDiagnostics> &samples)
               << mean(samples, &femm::EvaluationDiagnostics::fluxLinkageMs)
               << " torque_mean_ms="
               << mean(samples, &femm::EvaluationDiagnostics::torqueMs)
+              << " age_harmonic_packaging_mean_ms="
+              << mean(samples, &femm::EvaluationDiagnostics::airGapHarmonicPackagingMs)
+              << " energy_coenergy_mean_ms="
+              << mean(samples, &femm::EvaluationDiagnostics::energyCoenergyMs)
               << " unaccounted_mean_ms=" << unaccounted / count
               << " newton_iterations_mean="
               << mean(samples, &femm::EvaluationDiagnostics::nonlinearIterations)

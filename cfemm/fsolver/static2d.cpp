@@ -196,6 +196,7 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
         }
 
         // first, tack in air gap element contributions
+        const auto airGapAssemblyStarted = std::chrono::steady_clock::now();
         for(i=0;i<NumAirGapElems;i++)
         {
             double MG[10][10];
@@ -355,7 +356,13 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
             }
 
         }
+        lastStaticSolveTimings.airGapMatrixAssemblyMs +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - airGapAssemblyStarted).count();
 
+        const auto elementAssemblyStarted = std::chrono::steady_clock::now();
+        const double elementMaterialBefore =
+            lastStaticSolveTimings.nonlinearMaterialEvaluationMs;
         for(i = 0; i < NumEls; i++)
         {
 
@@ -826,8 +833,18 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
                 L.rhs()[n[j]]-=be[j];
             }
         }
+        const double elementAssemblyElapsed =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - elementAssemblyStarted).count();
+        const double elementMaterialElapsed =
+            lastStaticSolveTimings.nonlinearMaterialEvaluationMs -
+            elementMaterialBefore;
+        lastStaticSolveTimings.elementMatrixAssemblyMs +=
+            elementAssemblyElapsed > elementMaterialElapsed
+                ? elementAssemblyElapsed - elementMaterialElapsed : 0.0;
 
         // add in contribution from point currents;
+        const auto rhsConstructionStarted = std::chrono::steady_clock::now();
         for(i = 0; i<NumNodes; i++)
         {
             if(meshnode[i].BoundaryMarker>=0)
@@ -835,8 +852,12 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
                 L.rhs()[i]+=(0.01*nodeproplist[meshnode[i].BoundaryMarker].J.re);
             }
         }
+        lastStaticSolveTimings.rhsConstructionMs +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - rhsConstructionStarted).count();
 
         // apply fixed boundary conditions at points;
+        const auto boundaryApplicationStarted = std::chrono::steady_clock::now();
         for(i = 0; i<NumNodes; i++)
         {
             if(meshnode[i].BoundaryMarker >=0)
@@ -950,6 +971,9 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
                 L.constrain_periodic(pbclist[k].x,pbclist[k].y,true);
             }
         }
+        lastStaticSolveTimings.boundaryConditionApplicationMs +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - boundaryApplicationStarted).count();
 
         // solve the problem;
         for(j=0;j<NumNodes;j++)

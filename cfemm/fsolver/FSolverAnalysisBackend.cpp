@@ -542,6 +542,14 @@ TrialSolution FSolverAnalysisBackend::solveConfigured(
         staticTimings.nonlinearMaterialEvaluationMs;
     result.diagnostics.numericMatrixAssemblyMs =
         staticTimings.numericMatrixAssemblyMs;
+    result.diagnostics.airGapMatrixAssemblyMs =
+        staticTimings.airGapMatrixAssemblyMs;
+    result.diagnostics.elementMatrixAssemblyMs =
+        staticTimings.elementMatrixAssemblyMs;
+    result.diagnostics.rhsConstructionMs =
+        staticTimings.rhsConstructionMs;
+    result.diagnostics.boundaryConditionApplicationMs =
+        staticTimings.boundaryConditionApplicationMs;
     result.diagnostics.sparsePackingMs = linear.sparsePackingMs;
     result.diagnostics.hostToDeviceMs = linear.hostToDeviceMs;
     result.diagnostics.numericFactorizationMs = linear.numericFactorizationMs;
