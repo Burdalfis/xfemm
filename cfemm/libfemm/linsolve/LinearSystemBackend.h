@@ -19,6 +19,7 @@
 
 #include "femmcomplex.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -27,6 +28,69 @@
 namespace femm {
 
 enum class ScalarType { Real, Complex };
+
+/** Optional numerical-assembly implementation for the persistent planar path. */
+enum class PlanarAssemblyBackend { Host, CudaAtomic, CudaDeterministic };
+
+/** Flattened zero-frequency material data consumed by planar CUDA assembly. */
+struct PlanarAssemblyMaterial
+{
+    double muX = 1;
+    double muY = 1;
+    double laminationFill = 1;
+    double conductivity = 0;
+    int laminationType = 0;
+    std::int32_t bhOffset = 0;
+    std::int32_t bhCount = 0;
+};
+
+/** Immutable geometry/source data for one planar triangular element. */
+struct PlanarAssemblyElement
+{
+    std::array<std::int32_t, 3> nodes{};
+    std::array<double, 3> p{};
+    std::array<double, 3> q{};
+    std::array<double, 9> mx{};
+    std::array<double, 9> my{};
+    std::array<double, 9> mxy{};
+    std::array<double, 9> fixedMatrix{};
+    std::array<double, 3> fixedRhs{};
+    double area = 0;
+    std::int32_t material = -1;
+    std::int32_t circuit = -1;
+};
+
+enum class PlanarAssemblyConstraintKind { Dirichlet, Periodic, Antiperiodic };
+
+struct PlanarAssemblyConstraint
+{
+    PlanarAssemblyConstraintKind kind = PlanarAssemblyConstraintKind::Dirichlet;
+    std::int32_t a = 0;
+    std::int32_t b = 0;
+    double value = 0;
+};
+
+/** Mesh-lifetime data for the audited zero-frequency planar formulation. */
+struct PlanarAssemblyPlan
+{
+    std::int32_t nodeCount = 0;
+    std::vector<PlanarAssemblyElement> elements;
+    std::vector<PlanarAssemblyMaterial> materials;
+    std::vector<double> bhFluxDensity;
+    std::vector<double> bhField;
+    std::vector<double> bhSlope;
+    std::vector<double> explicitNodalRhs;
+    std::vector<PlanarAssemblyConstraint> constraints;
+};
+
+/** Per-Newton-iteration inputs; the nodal iterate is solution(). */
+struct PlanarAssemblyState
+{
+    std::vector<double> circuitSource;
+    std::vector<std::int32_t> circuitCase;
+    int nonlinearIteration = 0;
+    bool warmStart = false;
+};
 
 /** Options controlling a single solve. */
 struct SolveOptions {
@@ -73,6 +137,16 @@ struct LinearSystemDiagnostics {
     double solveMs = 0;
     double deviceToHostMs = 0;
     double residualEvaluationMs = 0;
+    double deviceAssemblyClearMs = 0;
+    double deviceMaterialMs = 0;
+    double deviceElementMs = 0;
+    double deviceScatterMs = 0;
+    double deviceAgeUploadMs = 0;
+    double deviceConstraintMs = 0;
+    double assemblyParityMaxAbsoluteEntry = 0;
+    double assemblyParityMaxRelativeEntry = 0;
+    double assemblyParityMaxAbsoluteRhs = 0;
+    double assemblyParitySymmetryDifference = 0;
     std::uint64_t matrixNonzeros = 0;
     std::uint64_t factorNonzeros = 0;
     std::uint64_t permanentDeviceBytes = 0;
@@ -90,6 +164,7 @@ struct LinearSystemDiagnostics {
     bool exactTopologyFallback = false;
     bool factorizationRetained = false;
     bool deterministic = false;
+    bool deviceAssemblyUsed = false;
     std::size_t linearSolves = 0;
 };
 
@@ -182,6 +257,12 @@ public:
             for (int column = row; column < 3; ++column)
                 add_to(values[entry++], nodes[row], nodes[column]);
     }
+
+    /** Configure/launch optional persistent planar device assembly. Returns
+     * false when the backend is host-only or a new bucket needs one host
+     * bootstrap solve before its analyzed graph is available. */
+    virtual void configure_planar_assembly(const PlanarAssemblyPlan &) {}
+    virtual bool assemble_planar_device(const PlanarAssemblyState &) { return false; }
     virtual Scalar get(int row, int col, int matrix = 0) = 0;
 
     /** Impose a Dirichlet value at node i, eliminating the corresponding

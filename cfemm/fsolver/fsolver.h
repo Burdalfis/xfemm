@@ -186,6 +186,7 @@ private:
     {
         static2DElementAssemblyData.clear();
         static2DDynamicAssemblyData.clear();
+        static2DPlan = {};
     }
 
     virtual void CleanUp() override;
@@ -234,6 +235,7 @@ private:
     StaticSolveTimings lastStaticSolveTimings;
     std::vector<Static2DElementAssemblyData> static2DElementAssemblyData;
     std::vector<Static2DDynamicAssemblyData> static2DDynamicAssemblyData;
+    femm::PlanarAssemblyPlan static2DPlan;
 };
 
 /////////////////////////////////////////////////////////////////////////////

@@ -25,6 +25,7 @@ struct CudssBackendOptions {
     bool deterministic = false;
     /** Maximum resident assembly/cuDSS contexts. Must allow committed + trial. */
     std::size_t bucketCacheCapacity = 2;
+    PlanarAssemblyBackend assemblyBackend = PlanarAssemblyBackend::Host;
 };
 
 /**
@@ -59,6 +60,8 @@ public:
     void add_symmetric_3x3(std::size_t elementIndex,
                            const int nodes[3],
                            const double values[6]) override;
+    void configure_planar_assembly(const PlanarAssemblyPlan &) override;
+    bool assemble_planar_device(const PlanarAssemblyState &) override;
     double get(int row, int col, int matrix = 0) override;
     void set_value(int i, double x) override;
     void constrain_periodic(int a, int b, bool antiperiodic) override;

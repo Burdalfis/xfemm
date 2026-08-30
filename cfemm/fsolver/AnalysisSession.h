@@ -212,6 +212,16 @@ struct EvaluationDiagnostics {
     double linearSolveMs = 0;
     double deviceToHostMs = 0;
     double residualEvaluationMs = 0;
+    double deviceAssemblyClearMs = 0;
+    double deviceMaterialMs = 0;
+    double deviceElementMs = 0;
+    double deviceScatterMs = 0;
+    double deviceAgeUploadMs = 0;
+    double deviceConstraintMs = 0;
+    double assemblyParityMaxAbsoluteEntry = 0;
+    double assemblyParityMaxRelativeEntry = 0;
+    double assemblyParityMaxAbsoluteRhs = 0;
+    double assemblyParitySymmetryDifference = 0;
     double nonlinearBookkeepingMs = 0;
     double resultPackagingMs = 0;
     double fluxLinkageMs = 0;
@@ -240,6 +250,7 @@ struct EvaluationDiagnostics {
     bool exactTopologyFallback = false;
     bool legacyFallback = false;
     bool deterministic = false;
+    bool deviceAssemblyUsed = false;
 };
 
 /** Strongly typed result payload for magnetostatic analyses. */

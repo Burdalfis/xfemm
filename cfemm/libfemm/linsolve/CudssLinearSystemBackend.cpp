@@ -1,4 +1,5 @@
 #include "CudssLinearSystemBackend.h"
+#include "CudaPlanarAssembly.h"
 
 #include "spars.h"
 
@@ -9,6 +10,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -307,6 +309,25 @@ public:
         return result;
     }
 
+    void configurePlanarAssembly(const PlanarAssemblyPlan &plan,
+                                 PlanarAssemblyBackend mode)
+    {
+        if (!m_planarAssembly)
+            m_planarAssembly = std::make_unique<CudaPlanarAssembly>(
+                plan, m_rows, m_columns, mode);
+    }
+
+    CudaPlanarAssemblyTimings assemblePlanar(
+        const PlanarAssemblyPlan &plan, PlanarAssemblyBackend mode,
+        const double *hostSolution, const PlanarAssemblyState &state,
+        const std::vector<CudaPlanarMatrixAdd> &age)
+    {
+        configurePlanarAssembly(plan, mode);
+        return m_planarAssembly->assemble(
+            m_stream, m_dValues.get(), m_dRhs.get(), m_dSolution.get(),
+            hostSolution, state, age);
+    }
+
     void solve(const HostCsr &exact, const double *rhs, double *solution,
                LinearSystemDiagnostics &diagnostics)
     {
@@ -344,6 +365,82 @@ public:
         diagnostics.peakDeviceBytes =
             static_cast<std::uint64_t>(std::max<std::int64_t>(0, m_memory[1]));
         diagnostics.factorizationRetained = true;
+    }
+
+    double solveDeviceAssembled(
+        const std::vector<CudaPlanarConstraint> &constraints,
+        double *solution, LinearSystemDiagnostics &diagnostics,
+        const HostCsr *parityMatrix = nullptr,
+        const double *parityRhs = nullptr)
+    {
+        if (!m_planarAssembly)
+            throw std::logic_error("CUDA planar solve has no device assembly plan");
+        diagnostics.deviceConstraintMs += m_planarAssembly->applyConstraints(
+            m_stream, m_dValues.get(), m_dRhs.get(), constraints);
+        if (parityMatrix && parityRhs) {
+            std::vector<double> expected(m_values.size());
+            if (!scatterValues(*parityMatrix, m_rows, m_columns, expected))
+                throw std::logic_error(
+                    "CUDA assembly parity matrix is outside analyzed graph");
+            std::vector<double> actual;
+            std::vector<double> actualRhs;
+            m_planarAssembly->downloadMatrixAndRhs(
+                m_stream, m_dValues.get(), m_dRhs.get(), actual, actualRhs);
+            for (std::size_t i = 0; i < actual.size(); ++i) {
+                const double difference = std::abs(actual[i] - expected[i]);
+                diagnostics.assemblyParityMaxAbsoluteEntry = std::max(
+                    diagnostics.assemblyParityMaxAbsoluteEntry, difference);
+                diagnostics.assemblyParityMaxRelativeEntry = std::max(
+                    diagnostics.assemblyParityMaxRelativeEntry,
+                    difference / std::max({1e-300, std::abs(actual[i]),
+                                           std::abs(expected[i])}));
+            }
+            for (std::size_t i = 0; i < actualRhs.size(); ++i)
+                diagnostics.assemblyParityMaxAbsoluteRhs = std::max(
+                    diagnostics.assemblyParityMaxAbsoluteRhs,
+                    std::abs(actualRhs[i] - parityRhs[i]));
+            // Both representations are the same explicitly symmetric lower
+            // triangle; no independent opposite triangle exists to differ.
+            diagnostics.assemblyParitySymmetryDifference = 0.;
+        }
+        const int phase = m_factorized ? CUDSS_PHASE_REFACTORIZATION
+                                       : CUDSS_PHASE_FACTORIZATION;
+        diagnostics.numericFactorizationMs += timeStream(m_stream, [&] {
+            XFEMM_CUDSS_CHECK(cudssExecute(m_handle, phase, m_config, m_data,
+                                           m_matrix, m_solution, m_rhs));
+        });
+        diagnostics.solveMs += timeStream(m_stream, [&] {
+            XFEMM_CUDSS_CHECK(cudssExecute(m_handle, CUDSS_PHASE_SOLVE, m_config,
+                                           m_data, m_matrix, m_solution, m_rhs));
+        });
+        const auto residualStarted = Clock::now();
+        const double residual = m_planarAssembly->relativeResidual(
+            m_stream, m_dValues.get(), m_dRhs.get(), m_dSolution.get());
+        diagnostics.residualEvaluationMs += elapsedMs(residualStarted);
+        diagnostics.deviceToHostMs += timeStream(m_stream, [&] {
+            XFEMM_CUDA_CHECK(cudaMemcpyAsync(
+                solution, m_dSolution.get(), m_dSolution.bytes(),
+                cudaMemcpyDeviceToHost, m_stream));
+        });
+        m_factorized = true;
+
+        std::int64_t factorNnz = 0;
+        std::size_t written = 0;
+        if (cudssDataGet(m_handle, m_data, CUDSS_DATA_LU_NNZ, &factorNnz,
+                         sizeof(factorNnz), &written) == CUDSS_STATUS_SUCCESS)
+            diagnostics.factorNonzeros =
+                static_cast<std::uint64_t>(std::max<std::int64_t>(0, factorNnz));
+        diagnostics.matrixNonzeros = m_columns.size();
+        const std::uint64_t ownedDeviceBytes = m_dRows.bytes() +
+            m_dColumns.bytes() + m_dValues.bytes() + m_dRhs.bytes() +
+            m_dSolution.bytes() + m_planarAssembly->deviceBytes();
+        diagnostics.permanentDeviceBytes = ownedDeviceBytes +
+            static_cast<std::uint64_t>(std::max<std::int64_t>(0, m_memory[0]));
+        diagnostics.peakDeviceBytes = ownedDeviceBytes +
+            static_cast<std::uint64_t>(std::max<std::int64_t>(0, m_memory[1]));
+        diagnostics.factorizationRetained = true;
+        diagnostics.deviceAssemblyUsed = true;
+        return residual;
     }
 
     RetainedFactorizationSolveReport solveRetained(
@@ -474,6 +571,7 @@ private:
     bool m_structureUploaded = false;
     bool m_factorized = false;
     bool m_deterministic = false;
+    std::unique_ptr<CudaPlanarAssembly> m_planarAssembly;
 };
 
 } // namespace
@@ -544,6 +642,16 @@ public:
         flags.assign(bucket.assembly->Q, static_cast<std::size_t>(dimension));
     }
 
+    void seedPlanarGraph(Bucket &bucket)
+    {
+        if (!planarPlan) return;
+        for (const auto &element : planarPlan->elements)
+            for (int row = 0; row < 3; ++row)
+                for (int column = row; column < 3; ++column)
+                    bucket.assembly->Put(0., element.nodes[row],
+                                         element.nodes[column]);
+    }
+
     void activate(CudssBucketDefinition definition)
     {
         const auto lookupStarted = Clock::now();
@@ -579,6 +687,7 @@ public:
             // topology in this bucket.
             for (const auto &entry : bucket->definition.upperEntries)
                 bucket->assembly->Put(0.0, entry.first, entry.second);
+            seedPlanarGraph(*bucket);
             found = buckets.emplace(bucket->definition.identity, std::move(bucket)).first;
             diagnostics.bucketConstructionMs += elapsedMs(constructionStarted);
             diagnostics.bucketReused = false;
@@ -623,6 +732,11 @@ public:
     ScalarView<int> flags;
     LinearSystemDiagnostics diagnostics;
     CudssContext *lastFactorization = nullptr;
+    std::unique_ptr<PlanarAssemblyPlan> planarPlan;
+    std::vector<CudaPlanarMatrixAdd> ageContributions;
+    std::vector<CudaPlanarConstraint> constraints;
+    CudssContext *deviceAssemblyContext = nullptr;
+    bool deviceAssemblyPending = false;
 };
 
 CudssLinearSystemBackend::CudssLinearSystemBackend(CudssBackendOptions options)
@@ -660,21 +774,88 @@ bool CudssLinearSystemBackend::create(int dimension, int bandwidth, int)
 }
 
 int CudssLinearSystemBackend::dimension() const { return m_impl->dimension; }
-void CudssLinearSystemBackend::wipe() { m_impl->ensureActive().assembly->Wipe(); }
+void CudssLinearSystemBackend::wipe()
+{
+    m_impl->ensureActive().assembly->Wipe();
+    m_impl->ageContributions.clear();
+    m_impl->constraints.clear();
+    m_impl->deviceAssemblyContext = nullptr;
+    m_impl->deviceAssemblyPending = false;
+}
 void CudssLinearSystemBackend::put(double v, int r, int c, int)
 { m_impl->ensureActive().assembly->Put(v, r, c); }
 void CudssLinearSystemBackend::add_to(double v, int r, int c, int)
-{ m_impl->ensureActive().assembly->AddTo(v, r, c); }
+{
+    m_impl->ensureActive().assembly->AddTo(v, r, c);
+    if (m_impl->planarPlan &&
+        m_impl->options.assemblyBackend != PlanarAssemblyBackend::Host)
+        m_impl->ageContributions.push_back(
+            {static_cast<std::int32_t>(r), static_cast<std::int32_t>(c), v});
+}
 void CudssLinearSystemBackend::add_symmetric_3x3(
     std::size_t elementIndex, const int nodes[3], const double values[6])
 {
     m_impl->ensureActive().assembly->AddSymmetric3x3(
         elementIndex, nodes, values);
 }
+void CudssLinearSystemBackend::configure_planar_assembly(
+    const PlanarAssemblyPlan &plan)
+{
+    if (m_impl->options.assemblyBackend == PlanarAssemblyBackend::Host)
+        return;
+    if (plan.nodeCount != m_impl->dimension)
+        throw std::invalid_argument("planar CUDA plan dimension disagrees with backend");
+    if (!m_impl->planarPlan) {
+        m_impl->planarPlan = std::make_unique<PlanarAssemblyPlan>(plan);
+        for (auto &entry : m_impl->buckets)
+            m_impl->seedPlanarGraph(*entry.second);
+    } else if (m_impl->planarPlan->elements.size() != plan.elements.size() ||
+               m_impl->planarPlan->materials.size() != plan.materials.size()) {
+        throw std::logic_error("persistent planar CUDA plan changed without mesh rebuild");
+    }
+}
+
+bool CudssLinearSystemBackend::assemble_planar_device(
+    const PlanarAssemblyState &state)
+{
+    if (m_impl->options.assemblyBackend == PlanarAssemblyBackend::Host ||
+        !m_impl->planarPlan)
+        return false;
+    auto &bucket = m_impl->ensureActive();
+    // A new bucket gets one exact host solve so all periodic transformations
+    // have established the validated graph before the device map is built.
+    if (!bucket.unionContext) return false;
+    CudssContext *context = bucket.unionContext.get();
+    const auto timings = context->assemblePlanar(
+        *m_impl->planarPlan, m_impl->options.assemblyBackend,
+        bucket.assembly->V, state, m_impl->ageContributions);
+    m_impl->constraints.clear();
+    m_impl->constraints.reserve(m_impl->planarPlan->constraints.size());
+    for (const auto &constraint : m_impl->planarPlan->constraints) {
+        CudaPlanarConstraintKind kind = CudaPlanarConstraintKind::Dirichlet;
+        if (constraint.kind == PlanarAssemblyConstraintKind::Periodic)
+            kind = CudaPlanarConstraintKind::Periodic;
+        else if (constraint.kind == PlanarAssemblyConstraintKind::Antiperiodic)
+            kind = CudaPlanarConstraintKind::Antiperiodic;
+        m_impl->constraints.push_back(
+            {kind, constraint.a, constraint.b, constraint.value});
+    }
+    m_impl->diagnostics.deviceAssemblyClearMs += timings.clearMs;
+    m_impl->diagnostics.deviceMaterialMs += timings.materialMs;
+    m_impl->diagnostics.deviceElementMs += timings.elementMs;
+    m_impl->diagnostics.deviceScatterMs += timings.scatterMs;
+    m_impl->diagnostics.deviceAgeUploadMs += timings.ageUploadMs;
+    m_impl->diagnostics.hostToDeviceBytes += timings.transferBytes;
+    m_impl->deviceAssemblyContext = context;
+    m_impl->deviceAssemblyPending = true;
+    return true;
+}
 double CudssLinearSystemBackend::get(int r, int c, int)
 { return m_impl->ensureActive().assembly->Get(r, c); }
 void CudssLinearSystemBackend::set_value(int i, double x)
-{ m_impl->ensureActive().assembly->SetValue(i, x); }
+{
+    m_impl->ensureActive().assembly->SetValue(i, x);
+}
 void CudssLinearSystemBackend::constrain_periodic(int a, int b, bool anti)
 {
     if (anti) m_impl->ensureActive().assembly->AntiPeriodicity(a, b);
@@ -706,6 +887,49 @@ SolveReport CudssLinearSystemBackend::solve(const SolveOptions &options)
     auto &bucket = m_impl->ensureActive();
     bucket.assembly->Precision = options.tolerance > 0 ? options.tolerance
                                                        : m_impl->precision;
+    if (m_impl->deviceAssemblyPending) {
+        if (!m_impl->deviceAssemblyContext)
+            throw std::logic_error("pending CUDA assembly lost its bucket context");
+        // Device assembly is only enabled after this bucket's union graph has
+        // completed its one host bootstrap/analyze solve. The retained
+        // descriptor and symbolic analysis are therefore being reused even
+        // though this path does not call contains() on a reconstructed host
+        // matrix.
+        m_impl->diagnostics.symbolicReused = true;
+        HostCsr parity;
+        const HostCsr *parityPointer = nullptr;
+        const double *parityRhs = nullptr;
+        if (std::getenv("XFEMM_CUDA_ASSEMBLY_PARITY")) {
+            parity = transposeUpperToLower(m_impl->exactMatrix());
+            parityPointer = &parity;
+            parityRhs = bucket.assembly->b;
+        }
+        const double residual = m_impl->deviceAssemblyContext->solveDeviceAssembled(
+            m_impl->constraints, bucket.assembly->V, m_impl->diagnostics,
+            parityPointer, parityRhs);
+        m_impl->lastFactorization = m_impl->deviceAssemblyContext;
+        ++m_impl->diagnostics.linearSolves;
+        m_impl->sessionSolution.assign(bucket.assembly->V,
+                                       bucket.assembly->V + m_impl->dimension);
+        m_impl->deviceAssemblyPending = false;
+        SolveReport report;
+        report.solver = "cudss-direct-spd-fp64-cuda-assembly";
+        report.iterations = 1;
+        report.relative_residual = residual;
+        report.converged = std::isfinite(residual) &&
+                           residual <= bucket.assembly->Precision;
+        m_impl->diagnostics.solver = report.solver;
+        m_impl->diagnostics.lastRelativeResidual = residual;
+        m_impl->diagnostics.allConverged =
+            m_impl->diagnostics.allConverged && report.converged;
+        if (!report.converged)
+            throw std::runtime_error(
+                "CUDA-assembled cuDSS residual " + std::to_string(residual) +
+                " exceeds tolerance " +
+                std::to_string(bucket.assembly->Precision));
+        return report;
+    }
+
     const auto packingStarted = Clock::now();
     HostCsr exactUpper = m_impl->exactMatrix();
     HostCsr exact = transposeUpperToLower(exactUpper);

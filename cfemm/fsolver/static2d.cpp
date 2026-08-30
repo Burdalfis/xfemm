@@ -205,6 +205,112 @@ void FSolver::prepareStatic2DAssemblyData()
             cached.fixedRhs[static_cast<std::size_t>(next)] += value;
         }
     }
+
+    static2DPlan = {};
+    static2DPlan.nodeCount = NumNodes;
+    static2DPlan.elements.resize(static2DElementAssemblyData.size());
+    for (std::size_t i = 0; i < static2DElementAssemblyData.size(); ++i) {
+        const auto &source = static2DElementAssemblyData[i];
+        auto &target = static2DPlan.elements[i];
+        for (int local = 0; local < 3; ++local) {
+            target.nodes[static_cast<std::size_t>(local)] =
+                source.nodes[static_cast<std::size_t>(local)];
+            target.p[static_cast<std::size_t>(local)] =
+                source.p[static_cast<std::size_t>(local)];
+            target.q[static_cast<std::size_t>(local)] =
+                source.q[static_cast<std::size_t>(local)];
+            target.fixedRhs[static_cast<std::size_t>(local)] =
+                source.fixedRhs[static_cast<std::size_t>(local)];
+        }
+        target.mx = source.mx;
+        target.my = source.my;
+        target.mxy = source.mxy;
+        target.fixedMatrix = source.fixedMatrix;
+        target.area = source.area;
+        target.material = source.block;
+        target.circuit = source.circuit;
+    }
+    static2DPlan.materials.resize(blockproplist.size());
+    for (std::size_t i = 0; i < blockproplist.size(); ++i) {
+        const auto &source = blockproplist[i];
+        auto &target = static2DPlan.materials[i];
+        target.muX = source.mu_x;
+        target.muY = source.mu_y;
+        target.laminationFill = source.LamFill;
+        target.conductivity = source.Cduct;
+        target.laminationType = source.LamType;
+        target.bhOffset = static_cast<std::int32_t>(
+            static2DPlan.bhFluxDensity.size());
+        target.bhCount = source.BHpoints;
+        for (int point = 0; point < source.BHpoints; ++point) {
+            static2DPlan.bhFluxDensity.push_back(
+                source.Bdata[static_cast<std::size_t>(point)]);
+            static2DPlan.bhField.push_back(
+                source.Hdata[static_cast<std::size_t>(point)].re);
+            static2DPlan.bhSlope.push_back(
+                source.slope[static_cast<std::size_t>(point)].re);
+        }
+    }
+    static2DPlan.explicitNodalRhs.assign(
+        static_cast<std::size_t>(NumNodes), 0.);
+    for (int node = 0; node < NumNodes; ++node) {
+        const int marker = meshnode[static_cast<std::size_t>(node)].BoundaryMarker;
+        if (marker >= 0)
+            static2DPlan.explicitNodalRhs[static_cast<std::size_t>(node)] =
+                0.01 * nodeproplist[static_cast<std::size_t>(marker)].J.re;
+    }
+    for (int node = 0; node < NumNodes; ++node) {
+        const int marker = meshnode[static_cast<std::size_t>(node)].BoundaryMarker;
+        if (marker >= 0 &&
+            nodeproplist[static_cast<std::size_t>(marker)].J.re == 0. &&
+            nodeproplist[static_cast<std::size_t>(marker)].J.im == 0.)
+            static2DPlan.constraints.push_back({
+                femm::PlanarAssemblyConstraintKind::Dirichlet,
+                static_cast<std::int32_t>(node), 0,
+                nodeproplist[static_cast<std::size_t>(marker)].A.re /
+                    equationScale});
+    }
+    for (int element = 0; element < NumEls; ++element) {
+        for (int edge = 0; edge < 3; ++edge) {
+            const int marker = meshele[static_cast<std::size_t>(element)].e[edge];
+            if (marker < 0 ||
+                lineproplist[static_cast<std::size_t>(marker)].BdryFormat != 0)
+                continue;
+            for (int endpoint = 0; endpoint < 2; ++endpoint) {
+                const int node = meshele[static_cast<std::size_t>(element)]
+                    .p[(edge + endpoint) % 3];
+                double first = meshnode[static_cast<std::size_t>(node)].x;
+                double second = meshnode[static_cast<std::size_t>(node)].y;
+                if (Coords == 0) {
+                    first /= units[LengthUnits];
+                    second /= units[LengthUnits];
+                } else {
+                    const double x = first;
+                    const double y = second;
+                    first = std::sqrt(x * x + y * y) / units[LengthUnits];
+                    second = (x == 0. && y == 0.) ? 0. :
+                        std::atan2(y, x) / DEG;
+                }
+                const auto &boundary = lineproplist[
+                    static_cast<std::size_t>(marker)];
+                double value = boundary.A0 + first * boundary.A1 +
+                               second * boundary.A2;
+                value *= std::cos(boundary.phi * DEG);
+                static2DPlan.constraints.push_back({
+                    femm::PlanarAssemblyConstraintKind::Dirichlet,
+                    static_cast<std::int32_t>(node), 0,
+                    value / equationScale});
+            }
+        }
+    }
+    for (int boundary = 0; boundary < NumPBCs; ++boundary) {
+        const auto &pair = pbclist[static_cast<std::size_t>(boundary)];
+        static2DPlan.constraints.push_back({
+            pair.t == 1 ? femm::PlanarAssemblyConstraintKind::Antiperiodic
+                        : femm::PlanarAssemblyConstraintKind::Periodic,
+            static_cast<std::int32_t>(pair.x),
+            static_cast<std::int32_t>(pair.y), 0.});
+    }
 }
 
 int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
@@ -238,6 +344,7 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
         GetFillFactor(i);
     }
     prepareStatic2DAssemblyData();
+    L.configure_planar_assembly(static2DPlan);
 
     // check to see if any circuits have been defined and process them;
     if (NumCircProps > 0)
@@ -531,6 +638,30 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
             }
         }
 
+        femm::PlanarAssemblyState deviceAssemblyState;
+        deviceAssemblyState.nonlinearIteration = Iter;
+        deviceAssemblyState.warmStart = sweepWarmStartUsed;
+        deviceAssemblyState.circuitSource.resize(
+            static_cast<std::size_t>(NumCircProps), 0.);
+        deviceAssemblyState.circuitCase.resize(
+            static_cast<std::size_t>(NumCircProps), 0);
+        for (int circuit = 0; circuit < NumCircProps; ++circuit) {
+            const auto &source = circproplist[static_cast<std::size_t>(circuit)];
+            deviceAssemblyState.circuitCase[static_cast<std::size_t>(circuit)] =
+                source.Case;
+            if (source.Case == 1)
+                deviceAssemblyState.circuitSource[static_cast<std::size_t>(circuit)] =
+                    source.J.re;
+            else if (source.Case == 0)
+                deviceAssemblyState.circuitSource[static_cast<std::size_t>(circuit)] =
+                    -source.dV.re;
+        }
+        const bool deviceAssembly =
+            L.assemble_planar_device(deviceAssemblyState);
+        const bool assemblyParity =
+            std::getenv("XFEMM_CUDA_ASSEMBLY_PARITY") != nullptr;
+        const bool skipHostVolume = deviceAssembly && !assemblyParity;
+
         // Material evaluation writes only its own element state and retained
         // local tangent. GetBHProps is a read-only interpolation over the
         // immutable material curve, so this pass is independent by element.
@@ -538,7 +669,7 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) num_threads(assemblyThreads) if(assemblyThreads > 1)
 #endif
-        for (i = 0; i < NumEls; ++i) {
+        for (i = 0; i < (skipHostVolume ? 0 : NumEls); ++i) {
             auto &element = meshele[static_cast<std::size_t>(i)];
             const auto &cached = static2DElementAssemblyData[
                 static_cast<std::size_t>(i)];
@@ -723,7 +854,7 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) num_threads(assemblyThreads) if(assemblyThreads > 1)
 #endif
-        for (i = 0; i < NumEls; ++i) {
+        for (i = 0; i < (skipHostVolume ? 0 : NumEls); ++i) {
             auto &element = meshele[static_cast<std::size_t>(i)];
             const auto &cached = static2DElementAssemblyData[
                 static_cast<std::size_t>(i)];
@@ -780,7 +911,7 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
                 dynamic.rhs[static_cast<std::size_t>(row)] = -localRhs[row];
         }
 
-        for (i = 0; i < NumEls; ++i) {
+        for (i = 0; i < (skipHostVolume ? 0 : NumEls); ++i) {
             const auto &cached = static2DElementAssemblyData[
                 static_cast<std::size_t>(i)];
             const auto &dynamic = static2DDynamicAssemblyData[
@@ -798,7 +929,7 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
 
         // add in contribution from point currents;
         const auto rhsConstructionStarted = std::chrono::steady_clock::now();
-        for(i = 0; i<NumNodes; i++)
+        for(i = 0; i < (skipHostVolume ? 0 : NumNodes); i++)
         {
             if(meshnode[i].BoundaryMarker>=0)
             {
@@ -811,6 +942,7 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
 
         // apply fixed boundary conditions at points;
         const auto boundaryApplicationStarted = std::chrono::steady_clock::now();
+        if (!skipHostVolume) {
         for(i = 0; i<NumNodes; i++)
         {
             if(meshnode[i].BoundaryMarker >=0)
@@ -923,6 +1055,7 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
             {
                 L.constrain_periodic(pbclist[k].x,pbclist[k].y,true);
             }
+        }
         }
         lastStaticSolveTimings.boundaryConditionApplicationMs +=
             std::chrono::duration<double, std::milli>(

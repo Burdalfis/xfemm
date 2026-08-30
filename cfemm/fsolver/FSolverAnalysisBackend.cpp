@@ -403,7 +403,8 @@ TrialSolution FSolverAnalysisBackend::solveConfigured(
 #ifdef XFEMM_USE_CUDSS
             return std::unique_ptr<femm::LinearSystemBackend<double>>(
                 new CudssLinearSystemBackend({m_cudssOptions.deterministic,
-                                              m_cudssOptions.bucketCacheCapacity}));
+                                              m_cudssOptions.bucketCacheCapacity,
+                                              m_cudssOptions.assemblyBackend}));
 #else
             throw std::runtime_error("cuDSS backend is not available in this build");
 #endif
@@ -556,6 +557,20 @@ TrialSolution FSolverAnalysisBackend::solveConfigured(
     result.diagnostics.linearSolveMs = linear.solveMs;
     result.diagnostics.deviceToHostMs = linear.deviceToHostMs;
     result.diagnostics.residualEvaluationMs = linear.residualEvaluationMs;
+    result.diagnostics.deviceAssemblyClearMs = linear.deviceAssemblyClearMs;
+    result.diagnostics.deviceMaterialMs = linear.deviceMaterialMs;
+    result.diagnostics.deviceElementMs = linear.deviceElementMs;
+    result.diagnostics.deviceScatterMs = linear.deviceScatterMs;
+    result.diagnostics.deviceAgeUploadMs = linear.deviceAgeUploadMs;
+    result.diagnostics.deviceConstraintMs = linear.deviceConstraintMs;
+    result.diagnostics.assemblyParityMaxAbsoluteEntry =
+        linear.assemblyParityMaxAbsoluteEntry;
+    result.diagnostics.assemblyParityMaxRelativeEntry =
+        linear.assemblyParityMaxRelativeEntry;
+    result.diagnostics.assemblyParityMaxAbsoluteRhs =
+        linear.assemblyParityMaxAbsoluteRhs;
+    result.diagnostics.assemblyParitySymmetryDifference =
+        linear.assemblyParitySymmetryDifference;
     result.diagnostics.nonlinearBookkeepingMs =
         staticTimings.nonlinearBookkeepingMs;
     result.diagnostics.resultPackagingMs = resultPackagingMs;
@@ -581,6 +596,7 @@ TrialSolution FSolverAnalysisBackend::solveConfigured(
     result.diagnostics.exactTopologyFallback = linear.exactTopologyFallback;
     result.diagnostics.legacyFallback = legacyFallback;
     result.diagnostics.deterministic = linear.deterministic;
+    result.diagnostics.deviceAssemblyUsed = linear.deviceAssemblyUsed;
     result.diagnostics.totalEvaluateMs = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - evaluateStarted).count();
     if (initialization)

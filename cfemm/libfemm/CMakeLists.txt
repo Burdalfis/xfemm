@@ -120,6 +120,7 @@ endif()
 # ---------------------------------------------------------------------------
 option(XFEMM_USE_CUDSS "Build the persistent native-real cuDSS backend" OFF)
 if(XFEMM_USE_CUDSS)
+    enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
     set(CUDSS_ROOT "" CACHE PATH "Optional cuDSS installation prefix")
     find_path(CUDSS_INCLUDE_DIR cudss.h HINTS "${CUDSS_ROOT}"
@@ -133,7 +134,10 @@ if(XFEMM_USE_CUDSS)
         message(FATAL_ERROR
             "XFEMM_USE_CUDSS was requested but cuDSS was not found. Set CUDSS_ROOT or install libcudss-dev.")
     endif()
-    target_sources(femm PRIVATE linsolve/CudssLinearSystemBackend.cpp)
+    target_sources(femm PRIVATE
+        linsolve/CudssLinearSystemBackend.cpp
+        linsolve/CudaPlanarAssembly.cu)
+    set_target_properties(femm PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
     target_include_directories(femm PRIVATE ${CUDSS_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
     target_compile_definitions(femm PUBLIC XFEMM_USE_CUDSS)
     target_link_libraries(femm PUBLIC CUDA::cudart ${CUDSS_LIBRARY})

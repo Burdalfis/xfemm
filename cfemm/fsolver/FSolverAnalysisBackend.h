@@ -31,6 +31,8 @@ struct CudssSessionOptions {
     bool explicitLegacyFallback = false;
     /** Bounded resident cuDSS bucket cache; two retains committed plus trial. */
     std::size_t bucketCacheCapacity = 2;
+    /** Optional zero-frequency planar numerical assembly path. */
+    PlanarAssemblyBackend assemblyBackend = PlanarAssemblyBackend::Host;
 };
 
 class FSolverAnalysisBackend final : public AnalysisSolverBackend {
