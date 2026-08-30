@@ -1,5 +1,6 @@
 #include "spars.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -64,11 +65,16 @@ int main()
         return 1;
     const int elementNodes[3] = {0, 1, 2};
     const double firstElement[6] = {4., 1., 0., 3., 2., 5.};
+    const double firstRhs[3] = {1.25, -2.5, .75};
     direct.AddSymmetric3x3(0, elementNodes, firstElement);
     std::size_t entry = 0;
     for (int row = 0; row < 3; ++row)
         for (int column = row; column < 3; ++column)
             reference.AddTo(firstElement[entry++], row, column);
+    for (int row = 0; row < 3; ++row) {
+        direct.b[row] += firstRhs[row];
+        reference.b[row] += firstRhs[row];
+    }
     std::vector<std::int32_t> directRows, directColumns;
     std::vector<std::int32_t> referenceRows, referenceColumns;
     std::vector<double> directValues, referenceValues;
@@ -82,11 +88,16 @@ int main()
     direct.Wipe();
     reference.Wipe();
     const double secondElement[6] = {2., -1., .5, 7., 3., 4.};
+    const double secondRhs[3] = {-3., .125, 8.};
     direct.AddSymmetric3x3(0, elementNodes, secondElement);
     entry = 0;
     for (int row = 0; row < 3; ++row)
         for (int column = row; column < 3; ++column)
             reference.AddTo(secondElement[entry++], row, column);
+    for (int row = 0; row < 3; ++row) {
+        direct.b[row] += secondRhs[row];
+        reference.b[row] += secondRhs[row];
+    }
     direct.copyUpperCsr(directRows, directColumns, directValues);
     reference.copyUpperCsr(referenceRows, referenceColumns, referenceValues);
     if (directRows != referenceRows || directColumns != referenceColumns ||
@@ -94,6 +105,33 @@ int main()
         std::cerr << "retained element destinations differ after wipe\n";
         ok = false;
     }
+    double maximumAbsoluteEntryDifference = 0.;
+    double maximumRelativeEntryDifference = 0.;
+    for (std::size_t i = 0; i < directValues.size(); ++i) {
+        const double difference = std::abs(directValues[i] - referenceValues[i]);
+        maximumAbsoluteEntryDifference = std::max(
+            maximumAbsoluteEntryDifference, difference);
+        maximumRelativeEntryDifference = std::max(
+            maximumRelativeEntryDifference,
+            difference / std::max(1.e-300, std::abs(referenceValues[i])));
+    }
+    double maximumRhsDifference = 0.;
+    double maximumSymmetryDifference = 0.;
+    for (int row = 0; row < 3; ++row) {
+        maximumRhsDifference = std::max(
+            maximumRhsDifference, std::abs(direct.b[row] - reference.b[row]));
+        for (int column = 0; column < 3; ++column)
+            maximumSymmetryDifference = std::max(
+                maximumSymmetryDifference,
+                std::abs(direct.Get(row, column) - direct.Get(column, row)));
+    }
+    std::cout << "spars_direct_assembly_parity max_abs_entry_difference="
+              << maximumAbsoluteEntryDifference
+              << " max_relative_entry_difference="
+              << maximumRelativeEntryDifference
+              << " max_rhs_difference=" << maximumRhsDifference
+              << " max_symmetry_difference=" << maximumSymmetryDifference
+              << '\n';
 
     // Restore the SPD matrix and exercise the packed SSOR/PCG path.
     problem.Wipe();
