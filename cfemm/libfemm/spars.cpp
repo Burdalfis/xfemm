@@ -226,16 +226,13 @@ int CBigLinProb::Create(int d, int bw)
     return 1;
 }
 
-void CBigLinProb::Put(double v, int p, int q)
+CEntry *CBigLinProb::entryFor(int p, int q)
 {
-    CEntry *e,*l = NULL;
-
-    m_compactRowsDirty = true;
-
     if (q<p)
         swap(p,q);
 
-    e = M[p];
+    CEntry *e = M[p];
+    CEntry *l = nullptr;
 
     while ((e->c < q) && (e->next != NULL))
     {
@@ -244,10 +241,7 @@ void CBigLinProb::Put(double v, int p, int q)
     }
 
     if (e->c == q)
-    {
-        e->x = v;
-        return;
-    }
+        return e;
 
     CEntry *m = new CEntry;
 
@@ -255,16 +249,22 @@ void CBigLinProb::Put(double v, int p, int q)
     {
         e->next = m;
         m->c = q;
-        m->x = v;
     }
     else
     {
         l->next = m;
         m->next = e;
         m->c = q;
-        m->x = v;
     }
-    return;
+    m_compactRowsDirty = true;
+    m_compactValuesDirty = true;
+    return m;
+}
+
+void CBigLinProb::Put(double v, int p, int q)
+{
+    entryFor(p, q)->x = v;
+    m_compactValuesDirty = true;
 }
 
 double CBigLinProb::Get(int p, int q)
@@ -287,13 +287,68 @@ double CBigLinProb::Get(int p, int q)
 
 void CBigLinProb::AddTo(double v, int p, int q)
 {
-	Put(Get(p,q)+v,p,q);
+    if (q < p)
+        swap(p, q);
+    CEntry *entry = M[p];
+    CEntry *previous = nullptr;
+    while (entry->c < q && entry->next != nullptr)
+    {
+        previous = entry;
+        entry = entry->next;
+    }
+    if (entry->c == q)
+    {
+        entry->x += v;
+        m_compactValuesDirty = true;
+        return;
+    }
+
+    CEntry *inserted = new CEntry;
+    inserted->c = q;
+    inserted->x = v;
+    if (entry->next == nullptr && q > entry->c)
+    {
+        entry->next = inserted;
+    }
+    else
+    {
+        previous->next = inserted;
+        inserted->next = entry;
+    }
+    m_compactRowsDirty = true;
+    m_compactValuesDirty = true;
+}
+
+void CBigLinProb::AddSymmetric3x3(
+    std::size_t elementIndex, const int nodes[3], const double values[6])
+{
+    if (m_elementEntries.size() <= elementIndex)
+        m_elementEntries.resize(elementIndex + 1);
+    ElementEntries &cached = m_elementEntries[elementIndex];
+    const std::array<int, 3> requested{{nodes[0], nodes[1], nodes[2]}};
+    if (cached.nodes != requested || cached.entries[0] == nullptr)
+    {
+        cached.nodes = requested;
+        std::size_t entry = 0;
+        for (int row = 0; row < 3; ++row)
+            for (int column = row; column < 3; ++column)
+                cached.entries[entry++] = entryFor(nodes[row], nodes[column]);
+    }
+    for (std::size_t entry = 0; entry < cached.entries.size(); ++entry)
+        cached.entries[entry]->x += values[entry];
+    m_compactValuesDirty = true;
 }
 
 void CBigLinProb::rebuildCompactRows()
 {
-    if (!m_compactRowsDirty)
+    if (!m_compactRowsDirty) {
+        if (m_compactValuesDirty) {
+            for (std::size_t i = 0; i < m_values.size(); ++i)
+                m_values[i] = m_compactEntries[i]->x;
+            m_compactValuesDirty = false;
+        }
         return;
+    }
 
     const auto packStarted = m_collectStats
         ? std::chrono::steady_clock::now()
@@ -307,6 +362,7 @@ void CBigLinProb::rebuildCompactRows()
     m_wideColumns.clear();
     m_wideRowIndices.clear();
     m_values.clear();
+    m_compactEntries.clear();
 
     for (int i = 0; i < n; ++i)
     {
@@ -315,6 +371,7 @@ void CBigLinProb::rebuildCompactRows()
         {
             m_columns.push_back(entry->c);
             m_values.push_back(entry->x);
+            m_compactEntries.push_back(entry);
         }
     }
     m_rowOffsets[static_cast<std::size_t>(n)] = m_values.size();
@@ -517,6 +574,7 @@ void CBigLinProb::rebuildCompactRows()
         if (m_useMixedColumnOffsets || m_useRowColumnOffsets)
             std::vector<int>().swap(m_columns);
         m_compactRowsDirty = false;
+        m_compactValuesDirty = false;
         if (m_collectStats)
         {
             ++m_packCalls;
@@ -567,6 +625,7 @@ void CBigLinProb::rebuildCompactRows()
         }
     }
     m_compactRowsDirty = false;
+    m_compactValuesDirty = false;
     if (m_collectStats)
     {
         ++m_packCalls;
@@ -1442,7 +1501,7 @@ void CBigLinProb::Wipe()
         }
         while(e!=NULL);
     }
-    m_compactRowsDirty = true;
+    m_compactValuesDirty = true;
 }
 
 void CBigLinProb::AntiPeriodicity(int i, int j)

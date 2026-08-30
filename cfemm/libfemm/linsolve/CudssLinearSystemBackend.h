@@ -56,6 +56,9 @@ public:
     void wipe() override;
     void put(double value, int row, int col, int matrix = 0) override;
     void add_to(double value, int row, int col, int matrix = 0) override;
+    void add_symmetric_3x3(std::size_t elementIndex,
+                           const int nodes[3],
+                           const double values[6]) override;
     double get(int row, int col, int matrix = 0) override;
     void set_value(int i, double x) override;
     void constrain_periodic(int a, int b, bool antiperiodic) override;

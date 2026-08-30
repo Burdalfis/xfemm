@@ -32,6 +32,7 @@
 #ifndef FSOLVER_H
 #define FSOLVER_H
 
+#include <array>
 #include <string>
 #include <vector>
 #include "feasolver.h"
@@ -157,6 +158,28 @@ public:
 
 private:
 
+    struct Static2DElementAssemblyData
+    {
+        std::array<int, 3> nodes{};
+        std::array<double, 3> p{};
+        std::array<double, 3> q{};
+        std::array<double, 9> mx{};
+        std::array<double, 9> my{};
+        std::array<double, 9> mxy{};
+        std::array<double, 9> fixedMatrix{};
+        std::array<double, 3> fixedRhs{};
+        double area = 0;
+        int block = -1;
+        int label = -1;
+        int circuit = -1;
+    };
+
+    void prepareStatic2DAssemblyData();
+    void invalidateStatic2DAssemblyData()
+    {
+        static2DElementAssemblyData.clear();
+    }
+
     virtual void CleanUp() override;
 
     /**
@@ -201,6 +224,7 @@ private:
     int lastNewtonIterations = 0;
     double lastNewtonRelativeUpdate = 0;
     StaticSolveTimings lastStaticSolveTimings;
+    std::vector<Static2DElementAssemblyData> static2DElementAssemblyData;
 };
 
 /////////////////////////////////////////////////////////////////////////////

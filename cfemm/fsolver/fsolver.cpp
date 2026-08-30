@@ -108,6 +108,7 @@ FSolver::~FSolver()
 
 void FSolver::CleanUp()
 {
+    invalidateStatic2DAssemblyData();
     FEASolver_type::CleanUp();
     //delete[] meshnode;
     //meshnode = NULL;
@@ -441,6 +442,7 @@ LoadMeshErr readLegacyMesh(const std::string &path, femm::LengthUnit units,
 
 LoadMeshErr FSolver::LoadMesh(const femm::mesh::SolverMesh &mesh)
 {
+    invalidateStatic2DAssemblyData();
     const std::size_t nodeCount = mesh.nodes.size();
     meshnode.clear(); meshnode.reserve(nodeCount);
     for (const auto &source : mesh.nodes) {
@@ -1288,6 +1290,7 @@ bool FSolver::runSolver(bool verbose)
 // SortNodes: sorts mesh nodes based on a new numbering
 void FSolver::SortNodes (std::vector<int> newnum)
 {
+    invalidateStatic2DAssemblyData();
     // sort mesh nodes based on newnum;
     for(int i = 0; i < NumNodes; i++)
     {

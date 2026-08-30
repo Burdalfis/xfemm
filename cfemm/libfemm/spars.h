@@ -22,6 +22,7 @@
 #ifndef SPARS_H
 #define SPARS_H
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -73,6 +74,9 @@ public:
     bool PCGSolve(int flag);	// flag==true if guess for V present;
     void MultPC(const double *X, double *Y);
     void AddTo(double v, int p, int q);
+    /** Add an indexed symmetric 3x3 element using retained entry addresses. */
+    void AddSymmetric3x3(std::size_t elementIndex,
+                         const int nodes[3], const double values[6]);
     void MultA(const double *X, double *Y);
     void SetValue(int i, double x);
     void Periodicity(int i, int j);
@@ -97,6 +101,7 @@ public:
 //		CFknDlg *TheView;
 
 private:
+    CEntry *entryFor(int row, int column);
     /**
      * Pack the linked-list assembly representation into contiguous upper
      * triangular rows.  Assembly benefits from stable entry addresses, while
@@ -127,10 +132,19 @@ private:
     std::vector<int> m_wideColumns;
     std::vector<int> m_wideRowIndices;
     std::vector<double> m_values;
+    std::vector<CEntry *> m_compactEntries;
     std::vector<std::size_t> m_symmetricRowOffsets;
     std::vector<int> m_symmetricColumns;
     std::vector<double> m_symmetricValues;
+    struct ElementEntries
+    {
+        std::array<int, 3> nodes{{-1, -1, -1}};
+        std::array<CEntry *, 6> entries{{nullptr, nullptr, nullptr,
+                                         nullptr, nullptr, nullptr}};
+    };
+    std::vector<ElementEntries> m_elementEntries;
     bool m_compactRowsDirty = true;
+    bool m_compactValuesDirty = true;
     int m_parallelThreads = 1;
     bool m_useJacobi = false;
     bool m_useParallelPcg = false;

@@ -55,6 +55,46 @@ int main()
     problem.MultA(input.data(), product.data());
     ok &= checkVector("rebuilt product", product, {{2, 2, 12}});
 
+    // The persistent element path must be numerically identical to six
+    // ordinary sparse additions and must retain valid destinations after a
+    // numerical wipe.
+    CBigLinProb direct;
+    CBigLinProb reference;
+    if (!direct.Create(3, 0) || !reference.Create(3, 0))
+        return 1;
+    const int elementNodes[3] = {0, 1, 2};
+    const double firstElement[6] = {4., 1., 0., 3., 2., 5.};
+    direct.AddSymmetric3x3(0, elementNodes, firstElement);
+    std::size_t entry = 0;
+    for (int row = 0; row < 3; ++row)
+        for (int column = row; column < 3; ++column)
+            reference.AddTo(firstElement[entry++], row, column);
+    std::vector<std::int32_t> directRows, directColumns;
+    std::vector<std::int32_t> referenceRows, referenceColumns;
+    std::vector<double> directValues, referenceValues;
+    direct.copyUpperCsr(directRows, directColumns, directValues);
+    reference.copyUpperCsr(referenceRows, referenceColumns, referenceValues);
+    if (directRows != referenceRows || directColumns != referenceColumns ||
+        directValues != referenceValues) {
+        std::cerr << "direct element assembly differs from scalar reference\n";
+        ok = false;
+    }
+    direct.Wipe();
+    reference.Wipe();
+    const double secondElement[6] = {2., -1., .5, 7., 3., 4.};
+    direct.AddSymmetric3x3(0, elementNodes, secondElement);
+    entry = 0;
+    for (int row = 0; row < 3; ++row)
+        for (int column = row; column < 3; ++column)
+            reference.AddTo(secondElement[entry++], row, column);
+    direct.copyUpperCsr(directRows, directColumns, directValues);
+    reference.copyUpperCsr(referenceRows, referenceColumns, referenceValues);
+    if (directRows != referenceRows || directColumns != referenceColumns ||
+        directValues != referenceValues) {
+        std::cerr << "retained element destinations differ after wipe\n";
+        ok = false;
+    }
+
     // Restore the SPD matrix and exercise the packed SSOR/PCG path.
     problem.Wipe();
     problem.AddTo(4, 0, 0);

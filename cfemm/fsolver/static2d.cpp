@@ -33,6 +33,7 @@
 #include <string>
 #include <cstdio>
 #include <chrono>
+#include <stdexcept>
 
 #include <csignal>
 
@@ -51,6 +52,127 @@ double Power(double x, int y)
 	return pow(x,(double) y);
 }
 
+void FSolver::prepareStatic2DAssemblyData()
+{
+    if (static2DElementAssemblyData.size() ==
+        static_cast<std::size_t>(NumEls))
+        return;
+
+    static2DElementAssemblyData.clear();
+    static2DElementAssemblyData.resize(static_cast<std::size_t>(NumEls));
+    const double equationScale = PI * 4.e-05;
+    const double units[] = {2.54, 0.1, 1., 100., 0.00254, 1.e-04};
+
+    for (int elementIndex = 0; elementIndex < NumEls; ++elementIndex) {
+        const auto &element = meshele[static_cast<std::size_t>(elementIndex)];
+        auto &cached = static2DElementAssemblyData[
+            static_cast<std::size_t>(elementIndex)];
+        cached.block = element.blk;
+        cached.label = element.lbl;
+        cached.circuit = labellist[static_cast<std::size_t>(element.lbl)].InCircuit;
+        for (int local = 0; local < 3; ++local)
+            cached.nodes[static_cast<std::size_t>(local)] = element.p[local];
+
+        const int n0 = cached.nodes[0];
+        const int n1 = cached.nodes[1];
+        const int n2 = cached.nodes[2];
+        cached.p = {{meshnode[n1].y - meshnode[n2].y,
+                     meshnode[n2].y - meshnode[n0].y,
+                     meshnode[n0].y - meshnode[n1].y}};
+        cached.q = {{meshnode[n2].x - meshnode[n1].x,
+                     meshnode[n0].x - meshnode[n2].x,
+                     meshnode[n1].x - meshnode[n0].x}};
+        cached.area = (cached.p[0] * cached.q[1] -
+                       cached.p[1] * cached.q[0]) / 2.;
+        const double geometryScale = -1. / (4. * cached.area);
+        for (int row = 0; row < 3; ++row) {
+            for (int column = 0; column < 3; ++column) {
+                const std::size_t slot = static_cast<std::size_t>(3 * row + column);
+                cached.mx[slot] = geometryScale * cached.p[row] * cached.p[column];
+                cached.my[slot] = geometryScale * cached.q[row] * cached.q[column];
+                cached.mxy[slot] = geometryScale *
+                    (cached.p[row] * cached.q[column] +
+                     cached.p[column] * cached.q[row]);
+            }
+        }
+
+        for (int edge = 0; edge < 3; ++edge) {
+            const int next = (edge + 1) % 3;
+            const double dx = meshnode[cached.nodes[next]].x -
+                              meshnode[cached.nodes[edge]].x;
+            const double dy = meshnode[cached.nodes[next]].y -
+                              meshnode[cached.nodes[edge]].y;
+            const double length = std::sqrt(dx * dx + dy * dy);
+            if (element.e[edge] < 0 ||
+                lineproplist[static_cast<std::size_t>(element.e[edge])].BdryFormat != 2)
+                continue;
+            const auto &boundary = lineproplist[
+                static_cast<std::size_t>(element.e[edge])];
+            const double matrixValue =
+                -0.0001 * equationScale * boundary.c0.re * length / 6.;
+            cached.fixedMatrix[static_cast<std::size_t>(3 * edge + edge)] +=
+                2. * matrixValue;
+            cached.fixedMatrix[static_cast<std::size_t>(3 * next + next)] +=
+                2. * matrixValue;
+            cached.fixedMatrix[static_cast<std::size_t>(3 * edge + next)] +=
+                matrixValue;
+            cached.fixedMatrix[static_cast<std::size_t>(3 * next + edge)] +=
+                matrixValue;
+            const double rhsValue = boundary.c1.re * length * 0.0001 / 2.;
+            cached.fixedRhs[static_cast<std::size_t>(edge)] += rhsValue;
+            cached.fixedRhs[static_cast<std::size_t>(next)] += rhsValue;
+        }
+
+        const auto &material = blockproplist[
+            static_cast<std::size_t>(cached.block)];
+        const auto &label = labellist[static_cast<std::size_t>(cached.label)];
+        const double fixedCurrentRhs = -material.J.re * cached.area / 3.;
+        for (double &value : cached.fixedRhs)
+            value += fixedCurrentRhs;
+
+        double magnetizationDirection = label.MagDir;
+        if (!label.MagDirFctn.empty()) {
+            CComplex center;
+            for (int local = 0; local < 3; ++local)
+                center += CComplex(meshnode[cached.nodes[local]].x,
+                                   meshnode[cached.nodes[local]].y);
+            center = center / units[LengthUnits] / 3.;
+            char expression[4096];
+            SNPRINTF(expression, sizeof expression,
+                     "x=%.17g\ny=%.17g\nr=x\nz=y\ntheta=%.17g\nR=%.17g\nreturn %s",
+                     center.re, center.im, arg(center) * 180. / PI, abs(center),
+                     label.MagDirFctn.c_str());
+            lua_State *lua = theLua->getLuaState();
+            const int initialTop = lua_gettop(lua);
+            const int error = theLua->doString(
+                expression, femm::LuaInstance::LuaStackMode::Unsafe);
+            if (error != 0 || lua_gettop(lua) == initialTop)
+                throw std::runtime_error(
+                    "could not evaluate element magnetization direction");
+            const char *result = lua_tostring(lua, -1);
+            if (!result || result[0] == '\0') {
+                lua_pop(lua, 1);
+                throw std::runtime_error(
+                    "element magnetization direction is not numeric");
+            }
+            magnetizationDirection = Re(lua_tonumber(lua, -1));
+            lua_pop(lua, 1);
+        }
+        const double cosine = std::cos(magnetizationDirection * PI / 180.);
+        const double sine = std::sin(magnetizationDirection * PI / 180.);
+        for (int local = 0; local < 3; ++local) {
+            const int next = (local + 1) % 3;
+            const double value = 0.0001 * material.H_c *
+                (cosine * (meshnode[cached.nodes[next]].x -
+                           meshnode[cached.nodes[local]].x) +
+                 sine * (meshnode[cached.nodes[next]].y -
+                         meshnode[cached.nodes[local]].y)) / 2.;
+            cached.fixedRhs[static_cast<std::size_t>(local)] += value;
+            cached.fixedRhs[static_cast<std::size_t>(next)] += value;
+        }
+    }
+}
+
 int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
 {
 
@@ -61,7 +183,7 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
     int i,j,k,w,s;
     double Me[3][3],be[3];      // element matrices;
     double Mx[3][3],My[3][3],Mxy[3][3],Mn[3][3];
-    double l[3],p[3],q[3];      // element shape parameters;
+    double p[3],q[3];           // element shape parameters;
     int n[3];                   // numbers of nodes for a particular element;
     double a,K,Ki,r,t,x,y,B,B1,B2,mu,v[3],u[3],dv,res,lastres=0,Cduct;
     double *V_old=nullptr;
@@ -85,6 +207,7 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
     {
         GetFillFactor(i);
     }
+    prepareStatic2DAssemblyData();
 
     // check to see if any circuits have been defined and process them;
     if (NumCircProps > 0)
@@ -380,236 +503,47 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
 //                pctr++;
 //            }
 
-            // zero out Me, be;
-            for(j = 0; j < 3; j++)
-            {
-                for(k = 0; k < 3; k++)
-                {
-                    Me[j][k] = 0.;
-                    Mx[j][k] = 0.;
-                    My[j][k] = 0.;
-                    Mn[j][k] = 0.;
-                    Mxy[j][k] = 0.;
-                }
-                be[j] = 0.;
-            }
-
-            // Determine shape parameters.
-            // l == element side lengths;
-            // p corresponds to the `b' parameter in Allaire
-            // q corresponds to the `c' parameter in Allaire
             El = &meshele[i];
-
-            for(k = 0; k<3; k++)
-            {
-                n[k] = El->p[k];
-            }
-
-            p[0] = meshnode[n[1]].y - meshnode[n[2]].y;
-            p[1] = meshnode[n[2]].y - meshnode[n[0]].y;
-            p[2] = meshnode[n[0]].y - meshnode[n[1]].y;
-            q[0] = meshnode[n[2]].x - meshnode[n[1]].x;
-            q[1] = meshnode[n[0]].x - meshnode[n[2]].x;
-            q[2] = meshnode[n[1]].x - meshnode[n[0]].x;
-
-            for(j = 0,k = 1; j<3; k++, j++)
-            {
-                if (k == 3)
-                {
-                    k = 0;
-                }
-
-                l[j] = sqrt( pow(meshnode[n[k]].x-meshnode[n[j]].x,2.) +
-                             pow(meshnode[n[k]].y-meshnode[n[j]].y,2.) );
-
-            }
-
-            a = (p[0]*q[1] - p[1]*q[0]) / 2.;
-
-            r = (meshnode[n[0]].x + meshnode[n[1]].x + meshnode[n[2]].x) / 3.;
-
-            // x-contribution; only need to do main diagonal and above;
-            K = (-1. / (4.*a));
-
-            for(j = 0; j<3; j++)
-            {
-                for(k = j; k<3; k++)
-                {
-                    Mx[j][k] += K * p[j] * p[k];
-                    if (j != k)
-                    {
-                        Mx[k][j] += K * p[j] * p[k];
-                    }
+            const auto &cached = static2DElementAssemblyData[
+                static_cast<std::size_t>(i)];
+            for (j = 0; j < 3; ++j) {
+                n[j] = cached.nodes[static_cast<std::size_t>(j)];
+                p[j] = cached.p[static_cast<std::size_t>(j)];
+                q[j] = cached.q[static_cast<std::size_t>(j)];
+                be[j] = cached.fixedRhs[static_cast<std::size_t>(j)];
+                for (k = 0; k < 3; ++k) {
+                    const std::size_t slot = static_cast<std::size_t>(3 * j + k);
+                    Me[j][k] = cached.fixedMatrix[slot];
+                    Mx[j][k] = cached.mx[slot];
+                    My[j][k] = cached.my[slot];
+                    Mxy[j][k] = cached.mxy[slot];
+                    Mn[j][k] = 0.;
                 }
             }
+            a = cached.area;
 
-            // y-contribution; only need to do main diagonal and above;
-            K = (-1. / (4.*a));
-            for(j = 0; j < 3; j++)
-            {
-                for(k = j; k < 3; k++)
-                {
-                    My[j][k] +=K*q[j]*q[k];
-                    if (j != k)
-                    {
-                        My[k][j] += K * q[j] * q[k];
-                    }
-                }
+            // Only the circuit scalar is state dependent; geometry, material
+            // association, permanent-magnet source, and fixed block current
+            // density are already represented by the cached data.
+            t = 0.;
+            if (cached.circuit >= 0) {
+                const auto &circuit = circproplist[
+                    static_cast<std::size_t>(cached.circuit)];
+                if (circuit.Case == 1)
+                    t = circuit.J.re;
+                else if (circuit.Case == 0)
+                    t = -circuit.dV.re *
+                        blockproplist[static_cast<std::size_t>(cached.block)].Cduct;
             }
-
-            // xy-contribution;
-            K = (-1. / (4.*a));
-            for (j = 0; j < 3; j++)
-            {
-                for (k = j; k < 3; k++)
-                {
-                    Mxy[j][k] += K*(p[j] * q[k] + p[k] * q[j]);
-                    if (j != k)
-                    {
-                        Mxy[k][j] += K*(p[j] * q[k] + p[k] * q[j]);
-                    }
-                }
-            }
-
-            // contributions to Me, be from derivative boundary conditions;
-            for(j = 0; j<3; j++)
-            {
-                if (El->e[j] >= 0)
-                {
-                    if (lineproplist[El->e[j]].BdryFormat==2)
-                    {
-                        // conversion factor is 10^(-4) (I think...)
-                        K = -0.0001*c*lineproplist[ El->e[j] ].c0.re*l[j]/6.;
-                        k = j+1;
-                        if(k==3) k = 0;
-                        Me[j][j]+=K*2.;
-                        Me[k][k]+=K*2.;
-                        Me[j][k]+=K;
-                        Me[k][j]+=K;
-
-                        K = (lineproplist[ El->e[j] ].c1.re*l[j]/2.)*0.0001;
-                        be[j]+=K;
-                        be[k]+=K;
-                    }
-                }
-            }
-
-            // contribution to be from current density in the block
-            for(j = 0; j<3; j++)
-            {
-                t = 0;
-                if ( labellist[El->lbl].InCircuit >= 0 )
-                {
-                    k = labellist[El->lbl].InCircuit;
-
-                    if(circproplist[k].Case==1)
-                    {
-                        t = circproplist[k].J.Re();
-                    }
-
-                    if(circproplist[k].Case==0)
-                    {
-                        t = -circproplist[k].dV.Re()*blockproplist[El->blk].Cduct;
-                    }
-                }
-
-                K = -(blockproplist[El->blk].J.re+t)*a/3.;
-
-                be[j]+=K;
-
-                // record avg current density in the block for use in incremental solutions
-                if (bIncremental==MS_LEGACY_FALSE) El->Jprev+=(blockproplist[El->blk].J.Re()+t)/3.;
-            }
-
-            // contribution to be from magnetization in the block;
-            t = labellist[El->lbl].MagDir;
-            // create the formatter object in case of a lua defined mag direction
-//                boost::format fmatter("x=%.17g\ny=%.17g\nr=x\nz=y\ntheta=%.17g\nR=%.17g\nreturn %s");
-            if (!labellist[El->lbl].MagDirFctn.empty()) // functional magnetization direction
-            {
-
-                char magbuff[4096];
-                std::string str;
-                CComplex X;
-                int top1,top2,lua_error_code;
-
-                for (j = 0,X = 0; j<3; j++)
-                {
-                    X += (CComplex)(meshnode[n[j]].x + I * meshnode[n[j]].y);
-                }
-                X = X/units[LengthUnits]/3.;
-                // generate the string using boost::format
-//                    fmatter % (X.re) % (X.im) % (arg(X)*180/PI) % (abs(X)) % (labellist[El->lbl].MagDirFctn);
-                // get the created string
-//                    str = fmatter.str();
-                SNPRINTF(magbuff, sizeof magbuff, "x=%.17g\ny=%.17g\nr=x\nz=y\ntheta=%.17g\nR=%.17g\nreturn %s",
-                              (X.re) , (X.im) , (arg(X)*180/PI) , (abs(X)) , (labellist[El->lbl].MagDirFctn.c_str()));
-                str = magbuff;
-                lua_State * lua = theLua->getLuaState();
-
-                top1 = lua_gettop(lua);
-
-                lua_error_code = theLua->doString(str, femm::LuaInstance::LuaStackMode::Unsafe);
-
-                if(lua_error_code != 0)
-                {
-                    if (lua_error_code==LUA_ERRRUN)
-                        WarnMessage("Lua run Error (LUA_ERRRUN) when evaluating magnetization direction function");
-                    if (lua_error_code==LUA_ERRMEM)
-                        WarnMessage("Lua memory Error (LUA_ERRMEM) when evaluating magnetization direction function");
-                    if (lua_error_code==LUA_ERRERR)
-                        WarnMessage("Lua user error error (LUA_ERRERR) when evaluating magnetization direction function");
-                    if (lua_error_code==LUA_ERRFILE)
-                        WarnMessage("Lua file error (LUA_ERRFILE) when evaluating magnetization direction function");
-
-                    SNPRINTF(magbuff, sizeof magbuff,
-                             "Lua error occurred when evaluating:\n\"%s\"",
-                             labellist[El->lbl].MagDirFctn.c_str());
-
-                    WarnMessage (magbuff);
-
-                    return -7;
-                }
-
-                top2 = lua_gettop(lua);
-
-                if (top2!=top1)
-                {
-                    str = lua_tostring(lua,-1);
-
-                    if (str.length()==0)
-                    {
-                        SNPRINTF(magbuff, sizeof magbuff,
-                                 "\"%s\" does not evaluate to a numerical value",
-                                 labellist[El->lbl].MagDirFctn.c_str());
-
-                        WarnMessage (magbuff);
-
-                        return -7;
-                    }
-                    else
-                    {
-                        t = Re(lua_tonumber(lua,-1));
-                    }
-
-                    lua_pop(lua, 1);
-                }
-
-            }
-            for(j = 0; j<3; j++)
-            {
-                k = j+1;
-                if(k==3)
-                {
-                    k = 0;
-                }
-                // need to scale so that everything is in proper units...
-                // conversion is 0.0001
-                K = 0.0001*blockproplist[El->blk].H_c*(
-                        cos(t*PI/180.)*(meshnode[n[k]].x-meshnode[n[j]].x) +
-                        sin(t*PI/180.)*(meshnode[n[k]].y-meshnode[n[j]].y) )/2.;
-                be[j]+=K;
-                be[k]+=K;
+            const double circuitRhs = -t * a / 3.;
+            for (j = 0; j < 3; ++j) {
+                be[j] += circuitRhs;
+                // Preserve the legacy three-add ordering for incremental
+                // solution bookkeeping.
+                if (bIncremental == MS_LEGACY_FALSE)
+                    El->Jprev +=
+                        (blockproplist[static_cast<std::size_t>(cached.block)].J.Re() +
+                         t) / 3.;
             }
 
 //////// Nonlinear Part
@@ -824,15 +758,15 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
                     be[j]+=Mn[j][k]*L.solution()[n[k]];
                 }
 
-            for (j = 0; j<3; j++)
-            {
-                for (k = j; k<3; k++)
-                {
-                    L.add_to(-Me[j][k],n[j],n[k]);
-                }
-
-                L.rhs()[n[j]]-=be[j];
-            }
+            double upperElementValues[6];
+            std::size_t upperEntry = 0;
+            for (j = 0; j < 3; ++j)
+                for (k = j; k < 3; ++k)
+                    upperElementValues[upperEntry++] = -Me[j][k];
+            L.add_symmetric_3x3(static_cast<std::size_t>(i), n,
+                                upperElementValues);
+            for (j = 0; j < 3; ++j)
+                L.rhs()[n[j]] -= be[j];
         }
         const double elementAssemblyElapsed =
             std::chrono::duration<double, std::milli>(

@@ -170,6 +170,18 @@ public:
      *  ignore the selector). */
     virtual void put(Scalar value, int row, int col, int matrix = 0) = 0;
     virtual void add_to(Scalar value, int row, int col, int matrix = 0) = 0;
+    /** Add one symmetric three-node element in upper-local order
+     *  (00, 01, 02, 11, 12, 22). Persistent backends may cache the exact
+     *  destination of each entry by element index. */
+    virtual void add_symmetric_3x3(std::size_t,
+                                   const int nodes[3],
+                                   const Scalar values[6])
+    {
+        std::size_t entry = 0;
+        for (int row = 0; row < 3; ++row)
+            for (int column = row; column < 3; ++column)
+                add_to(values[entry++], nodes[row], nodes[column]);
+    }
     virtual Scalar get(int row, int col, int matrix = 0) = 0;
 
     /** Impose a Dirichlet value at node i, eliminating the corresponding

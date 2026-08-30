@@ -665,6 +665,12 @@ void CudssLinearSystemBackend::put(double v, int r, int c, int)
 { m_impl->ensureActive().assembly->Put(v, r, c); }
 void CudssLinearSystemBackend::add_to(double v, int r, int c, int)
 { m_impl->ensureActive().assembly->AddTo(v, r, c); }
+void CudssLinearSystemBackend::add_symmetric_3x3(
+    std::size_t elementIndex, const int nodes[3], const double values[6])
+{
+    m_impl->ensureActive().assembly->AddSymmetric3x3(
+        elementIndex, nodes, values);
+}
 double CudssLinearSystemBackend::get(int r, int c, int)
 { return m_impl->ensureActive().assembly->Get(r, c); }
 void CudssLinearSystemBackend::set_value(int i, double x)
