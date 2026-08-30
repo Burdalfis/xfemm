@@ -55,12 +55,16 @@ void printHeader()
            "material_ms,matrix_assembly_ms,sparse_pack_scatter_ms,h2d_ms,"
            "age_matrix_ms,element_matrix_and_rhs_ms,explicit_rhs_ms,"
            "boundary_constraints_ms,"
+           "device_clear_ms,device_material_ms,device_element_ms,"
+           "device_scatter_ms,device_age_upload_ms,device_constraint_ms,"
            "factor_ms,solve_ms,d2h_ms,residual_ms,nonlinear_bookkeeping_ms,"
            "result_packaging_ms,postprocessor_update_ms,flux_ms,torque_ms,"
            "age_harmonic_packaging_ms,energy_coenergy_ms,"
            "unaccounted_ms,newton_iterations,matrix_nonzeros,factor_nonzeros,"
            "permanent_device_bytes,peak_device_bytes,h2d_bytes,relative_residual,"
-           "bucket_reused,symbolic_reused,exact_fallback,bucket_identity\n";
+           "bucket_reused,symbolic_reused,exact_fallback,device_assembly,"
+           "parity_max_abs_entry,parity_max_rel_entry,parity_max_abs_rhs,"
+           "parity_symmetry,bucket_identity\n";
 }
 
 void printProfile(const std::string &phase, std::size_t index, double angle,
@@ -79,6 +83,9 @@ void printProfile(const std::string &phase, std::size_t index, double angle,
               << d.hostToDeviceMs << ',' << d.airGapMatrixAssemblyMs << ','
               << d.elementMatrixAssemblyMs << ',' << d.rhsConstructionMs << ','
               << d.boundaryConditionApplicationMs << ','
+              << d.deviceAssemblyClearMs << ',' << d.deviceMaterialMs << ','
+              << d.deviceElementMs << ',' << d.deviceScatterMs << ','
+              << d.deviceAgeUploadMs << ',' << d.deviceConstraintMs << ','
               << d.numericFactorizationMs << ','
               << d.linearSolveMs << ',' << d.deviceToHostMs << ','
               << d.residualEvaluationMs << ',' << d.nonlinearBookkeepingMs << ','
@@ -91,7 +98,12 @@ void printProfile(const std::string &phase, std::size_t index, double angle,
               << d.permanentDeviceBytes << ',' << d.peakDeviceBytes << ','
               << d.hostToDeviceBytes << ',' << d.relativeResidual << ','
               << d.bucketReused << ',' << d.symbolicReused << ','
-              << d.exactTopologyFallback << ',' << d.bucketIdentity << '\n';
+              << d.exactTopologyFallback << ',' << d.deviceAssemblyUsed << ','
+              << d.assemblyParityMaxAbsoluteEntry << ','
+              << d.assemblyParityMaxRelativeEntry << ','
+              << d.assemblyParityMaxAbsoluteRhs << ','
+              << d.assemblyParitySymmetryDifference << ','
+              << d.bucketIdentity << '\n';
 }
 
 femm::TrialSolution evaluateOuterAngle(
@@ -116,6 +128,16 @@ femm::PhysicalResultLevel parseResultLevel(const std::string &name)
     if (name == "accepted") return femm::PhysicalResultLevel::AcceptedState;
     if (name == "full") return femm::PhysicalResultLevel::FullDiagnostics;
     throw std::invalid_argument("evaluation level must be residual, accepted, or full");
+}
+
+femm::PlanarAssemblyBackend parseAssemblyBackend(const std::string &name)
+{
+    if (name == "host") return femm::PlanarAssemblyBackend::Host;
+    if (name == "cuda") return femm::PlanarAssemblyBackend::CudaAtomic;
+    if (name == "cuda-deterministic")
+        return femm::PlanarAssemblyBackend::CudaDeterministic;
+    throw std::invalid_argument(
+        "assembly backend must be host, cuda, or cuda-deterministic");
 }
 
 void printPhysical(const std::string &phase, const femm::TrialSolution &result)
@@ -188,6 +210,18 @@ void printHotSummary(const std::vector<femm::EvaluationDiagnostics> &samples)
               << mean(samples, &femm::EvaluationDiagnostics::rhsConstructionMs)
               << " boundary_constraints_mean_ms="
               << mean(samples, &femm::EvaluationDiagnostics::boundaryConditionApplicationMs)
+              << " device_clear_mean_ms="
+              << mean(samples, &femm::EvaluationDiagnostics::deviceAssemblyClearMs)
+              << " device_material_mean_ms="
+              << mean(samples, &femm::EvaluationDiagnostics::deviceMaterialMs)
+              << " device_element_mean_ms="
+              << mean(samples, &femm::EvaluationDiagnostics::deviceElementMs)
+              << " device_scatter_mean_ms="
+              << mean(samples, &femm::EvaluationDiagnostics::deviceScatterMs)
+              << " device_age_upload_mean_ms="
+              << mean(samples, &femm::EvaluationDiagnostics::deviceAgeUploadMs)
+              << " device_constraint_mean_ms="
+              << mean(samples, &femm::EvaluationDiagnostics::deviceConstraintMs)
               << " sparse_pack_scatter_mean_ms="
               << mean(samples, &femm::EvaluationDiagnostics::sparsePackingMs)
               << " h2d_mean_ms="
@@ -224,18 +258,22 @@ void printHotSummary(const std::vector<femm::EvaluationDiagnostics> &samples)
 
 int main(int argc, char **argv)
 {
-    if (argc < 2 || argc > 4) {
+    if (argc < 2 || argc > 5) {
         std::cerr << "expected a sliding-AGE motor .fem path, optional bucket "
-                     "width, and optional residual|accepted|full level\n";
+                     "width, optional residual|accepted|full level, and optional "
+                     "host|cuda|cuda-deterministic assembly backend\n";
         return 2;
     }
     try {
         const bool legacyReference = argc == 3 && std::string(argv[2]) == "legacy";
         const double bucketWidth = argc >= 3 && !legacyReference
             ? std::stod(argv[2]) : 1.2;
-        const auto resultLevel = argc == 4
+        const auto resultLevel = argc >= 4
             ? parseResultLevel(argv[3])
             : femm::PhysicalResultLevel::FullDiagnostics;
+        const auto assemblyBackend = argc == 5
+            ? parseAssemblyBackend(argv[4])
+            : femm::PlanarAssemblyBackend::Host;
         if (legacyReference) {
             femm::PersistentMotorSession reference{
                 femm::ModelDefinition(loadProblem(argv[1]))};
@@ -263,7 +301,8 @@ int main(int argc, char **argv)
         }
         femm::PersistentMotorSession session(
             femm::ModelDefinition(loadProblem(argv[1])),
-            femm::CudssSessionOptions{bucketWidth, false, false});
+            femm::CudssSessionOptions{bucketWidth, false, false, 2,
+                                      assemblyBackend});
         if (std::abs(session.analysis().model().problem().Precision - 1e-8) > 1e-15)
             throw std::runtime_error("full-size production profile requires 1e-8 precision");
         if (session.analysis().solveParameters().airGapPositions.empty() ||

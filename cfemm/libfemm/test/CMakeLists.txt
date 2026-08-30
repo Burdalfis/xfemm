@@ -41,3 +41,11 @@ target_link_libraries(material_curve_test PRIVATE femm)
 
 add_test(NAME material_curve COMMAND material_curve_test)
 set_tests_properties(material_curve PROPERTIES LABELS "libfemm;unit")
+
+if(XFEMM_USE_CUDSS)
+    add_executable(cuda_planar_material_test cuda_planar_material_test.cpp)
+    target_link_libraries(cuda_planar_material_test PRIVATE femm)
+    add_test(NAME cuda_planar_material COMMAND cuda_planar_material_test)
+    set_tests_properties(cuda_planar_material PROPERTIES
+        LABELS "libfemm;cuda;unit" SKIP_RETURN_CODE 77)
+endif()
