@@ -27,15 +27,21 @@
 #include "lua.h"
 #include "LuaInstance.h"
 
+#include <algorithm>
 #include <stdio.h>
 #include <math.h>
 #include <malloc.h>
 #include <string>
 #include <cstdio>
 #include <chrono>
+#include <cstdlib>
 #include <stdexcept>
 
 #include <csignal>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #ifdef _MSC_VER
   #ifndef SNPRINTF
@@ -47,6 +53,30 @@
   #endif
 #endif
 
+namespace {
+
+int requestedAssemblyThreads()
+{
+#ifdef _OPENMP
+    const char *requested = std::getenv("XFEMM_ASSEMBLY_THREADS");
+    if (requested == nullptr || requested[0] == '\0')
+        requested = std::getenv("XFEMM_NUM_THREADS");
+    if (requested != nullptr && requested[0] != '\0') {
+        char *end = nullptr;
+        const long parsed = std::strtol(requested, &end, 10);
+        if (end != requested && *end == '\0' && parsed > 0 && parsed <= 1024)
+            return static_cast<int>(parsed);
+    }
+#endif
+#ifdef _OPENMP
+    return std::min(16, omp_get_max_threads());
+#else
+    return 1;
+#endif
+}
+
+} // namespace
+
 double Power(double x, int y)
 {
 	return pow(x,(double) y);
@@ -55,11 +85,15 @@ double Power(double x, int y)
 void FSolver::prepareStatic2DAssemblyData()
 {
     if (static2DElementAssemblyData.size() ==
-        static_cast<std::size_t>(NumEls))
+            static_cast<std::size_t>(NumEls) &&
+        static2DDynamicAssemblyData.size() ==
+            static_cast<std::size_t>(NumEls))
         return;
 
     static2DElementAssemblyData.clear();
     static2DElementAssemblyData.resize(static_cast<std::size_t>(NumEls));
+    static2DDynamicAssemblyData.clear();
+    static2DDynamicAssemblyData.resize(static_cast<std::size_t>(NumEls));
     const double equationScale = PI * 4.e-05;
     const double units[] = {2.54, 0.1, 1., 100., 0.00254, 1.e-04};
 
@@ -180,12 +214,10 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
     lastNewtonRelativeUpdate = 0;
     lastStaticSolveTimings = {};
 
-    int i,j,k,w,s;
-    double Me[3][3],be[3];      // element matrices;
-    double Mx[3][3],My[3][3],Mxy[3][3],Mn[3][3];
+    int i,j,k,s;
     double p[3],q[3];           // element shape parameters;
     int n[3];                   // numbers of nodes for a particular element;
-    double a,K,Ki,r,t,x,y,B,B1,B2,mu,v[3],u[3],dv,res,lastres=0,Cduct;
+    double a,K,Ki,r,t,x,y,res,lastres=0,Cduct;
     double *V_old=nullptr;
     double *CircInt1=nullptr;
     double *CircInt2=nullptr;
@@ -195,8 +227,6 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
     int Iter=0;
     bool LinearFlag=true;
     int bIncremental = MS_LEGACY_FALSE;
-	double murel, muinc;
-
 	if (!previousSolutionFile.empty()) bIncremental = PrevType;
 
     res=0;
@@ -484,299 +514,287 @@ int FSolver::Static2D(femm::LinearSystemBackend<double> &L)
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - airGapAssemblyStarted).count();
 
-        const auto elementAssemblyStarted = std::chrono::steady_clock::now();
-        const double elementMaterialBefore =
-            lastStaticSolveTimings.nonlinearMaterialEvaluationMs;
-        for(i = 0; i < NumEls; i++)
-        {
-
-//            // update ``building matrix'' progress bar...
-//            j = (i*20) / NumEls + 1;
-//            if(j > pctr)
-//            {
-//                j = pctr * 5;
-//                if (j>100)
-//                {
-//                    j = 100;
-//                }
-//                TheView->m_prog1.SetPos(j);
-//                pctr++;
-//            }
-
-            El = &meshele[i];
-            const auto &cached = static2DElementAssemblyData[
-                static_cast<std::size_t>(i)];
-            for (j = 0; j < 3; ++j) {
-                n[j] = cached.nodes[static_cast<std::size_t>(j)];
-                p[j] = cached.p[static_cast<std::size_t>(j)];
-                q[j] = cached.q[static_cast<std::size_t>(j)];
-                be[j] = cached.fixedRhs[static_cast<std::size_t>(j)];
-                for (k = 0; k < 3; ++k) {
-                    const std::size_t slot = static_cast<std::size_t>(3 * j + k);
-                    Me[j][k] = cached.fixedMatrix[slot];
-                    Mx[j][k] = cached.mx[slot];
-                    My[j][k] = cached.my[slot];
-                    Mxy[j][k] = cached.mxy[slot];
-                    Mn[j][k] = 0.;
+        const int assemblyThreads = requestedAssemblyThreads();
+        if (Iter == 0) {
+            for (i = 0; i < NumEls; ++i) {
+                const int block = static2DElementAssemblyData[
+                    static_cast<std::size_t>(i)].block;
+                if (blockproplist[static_cast<std::size_t>(block)].BHpoints == 0)
+                    continue;
+                if (bIncremental == MS_LEGACY_FALSE)
+                    LinearFlag = false;
+                else if (blockproplist[static_cast<std::size_t>(block)].LamType > 0) {
+                    PrintMessage("On-edge Lam Types not yet supported in\n"
+                                 "incremental/frozen permeability problems");
+                    exit(0);
                 }
             }
-            a = cached.area;
+        }
 
-            // Only the circuit scalar is state dependent; geometry, material
-            // association, permanent-magnet source, and fixed block current
-            // density are already represented by the cached data.
-            t = 0.;
+        // Material evaluation writes only its own element state and retained
+        // local tangent. GetBHProps is a read-only interpolation over the
+        // immutable material curve, so this pass is independent by element.
+        const auto materialStarted = std::chrono::steady_clock::now();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(assemblyThreads) if(assemblyThreads > 1)
+#endif
+        for (i = 0; i < NumEls; ++i) {
+            auto &element = meshele[static_cast<std::size_t>(i)];
+            const auto &cached = static2DElementAssemblyData[
+                static_cast<std::size_t>(i)];
+            auto &dynamic = static2DDynamicAssemblyData[
+                static_cast<std::size_t>(i)];
+            dynamic.nonlinearMatrix.fill(0.);
+            const int block = cached.block;
+            const auto &material = blockproplist[static_cast<std::size_t>(block)];
+
+            if (Iter == 0) {
+                if (material.LamType == 0) {
+                    const double fill = material.LamFill;
+                    element.mu1 = material.mu_x * fill + (1. - fill);
+                    element.mu2 = material.mu_y * fill + (1. - fill);
+                }
+                if (material.LamType == 1) {
+                    const double fill = material.LamFill;
+                    const double initialMu = material.mu_x;
+                    element.mu1 = initialMu * fill + (1. - fill);
+                    element.mu2 = initialMu / (fill + initialMu * (1. - fill));
+                }
+                if (material.LamType == 2) {
+                    const double fill = material.LamFill;
+                    const double initialMu = material.mu_y;
+                    element.mu2 = initialMu * fill + (1. - fill);
+                    element.mu1 = initialMu / (fill + initialMu * (1. - fill));
+                }
+                if (material.LamType > 2) {
+                    element.mu1 = 1.;
+                    element.mu2 = 1.;
+                }
+                if (material.BHpoints != 0 &&
+                    bIncremental != MS_LEGACY_FALSE) {
+                    double previousB1 = 0.;
+                    double previousB2 = 0.;
+                    getPrev2DB(i, previousB1, previousB2);
+                    const double previousB = std::sqrt(
+                        previousB1 * previousB1 + previousB2 * previousB2);
+                    double incrementalMu = 0.;
+                    double relativeMu = 0.;
+                    blockproplist[static_cast<std::size_t>(block)]
+                        .IncrementalPermeability(previousB, incrementalMu,
+                                                relativeMu);
+                    if (previousB == 0.) {
+                        element.mu1 = incrementalMu;
+                        element.mu2 = incrementalMu;
+                        element.v12 = 0.;
+                    } else if (bIncremental == 1) {
+                        element.mu1 = previousB * previousB * incrementalMu * relativeMu /
+                            (previousB1 * previousB1 * relativeMu +
+                             previousB2 * previousB2 * incrementalMu);
+                        element.mu2 = previousB * previousB * incrementalMu * relativeMu /
+                            (previousB1 * previousB1 * incrementalMu +
+                             previousB2 * previousB2 * relativeMu);
+                        element.v12 = -previousB1 * previousB2 *
+                            (relativeMu - incrementalMu) /
+                            (previousB * previousB * relativeMu * incrementalMu);
+                    } else {
+                        element.mu1 = relativeMu;
+                        element.mu2 = relativeMu;
+                        element.v12 = 0.;
+                    }
+                }
+            }
+
+            if (!(Iter > 0 || (Iter == 0 && sweepWarmStartUsed)))
+                continue;
+
+            const auto &nodes = cached.nodes;
+            const auto &pCached = cached.p;
+            const auto &qCached = cached.q;
+            const auto &mx = cached.mx;
+            const auto &my = cached.my;
+            double localB1 = 0.;
+            double localB2 = 0.;
+            double localMu = 0.;
+            double localDv = 0.;
+            double localV[3] = {0., 0., 0.};
+            double localU[3] = {0., 0., 0.};
+
+            if (material.LamType == 0 && element.mu1 == element.mu2 &&
+                material.BHpoints > 0) {
+                for (int local = 0; local < 3; ++local) {
+                    localB1 += L.solution()[nodes[local]] * qCached[local];
+                    localB2 += L.solution()[nodes[local]] * pCached[local];
+                }
+                const double fluxDensity = c * std::sqrt(
+                    localB1 * localB1 + localB2 * localB2) /
+                    (0.02 * cached.area);
+                blockproplist[static_cast<std::size_t>(block)]
+                    .GetBHProps(fluxDensity, localMu, localDv);
+                localMu = 1. / (muo * localMu);
+                element.mu1 = localMu;
+                element.mu2 = localMu;
+                for (int row = 0; row < 3; ++row)
+                    for (int column = 0; column < 3; ++column)
+                        localV[row] += (mx[3 * row + column] +
+                                        my[3 * row + column]) *
+                                       L.solution()[nodes[column]];
+                const double coefficient =
+                    -200. * c * c * c * localDv / cached.area;
+                for (int row = 0; row < 3; ++row)
+                    for (int column = 0; column < 3; ++column)
+                        dynamic.nonlinearMatrix[3 * row + column] =
+                            coefficient * localV[row] * localV[column];
+            }
+
+            if (material.LamType == 1 && material.BHpoints > 0) {
+                const double fill = material.LamFill;
+                for (int local = 0; local < 3; ++local) {
+                    localB1 += L.solution()[nodes[local]] * qCached[local];
+                    localB2 += L.solution()[nodes[local]] * pCached[local] / fill;
+                }
+                const double fluxDensity = c * std::sqrt(
+                    localB1 * localB1 + localB2 * localB2) /
+                    (0.02 * cached.area);
+                blockproplist[static_cast<std::size_t>(block)]
+                    .GetBHProps(fluxDensity, localMu, localDv);
+                localMu = 1. / (muo * localMu);
+                element.mu1 = localMu * fill;
+                element.mu2 = localMu / (fill + localMu * (1. - fill));
+                for (int row = 0; row < 3; ++row) {
+                    for (int column = 0; column < 3; ++column) {
+                        localV[row] += (my[3 * row + column] / fill +
+                                        mx[3 * row + column]) *
+                                       L.solution()[nodes[column]];
+                        localU[row] += (my[3 * row + column] / fill +
+                                        fill * mx[3 * row + column]) *
+                                       L.solution()[nodes[column]];
+                    }
+                }
+                const double coefficient =
+                    -100. * c * c * c * localDv / cached.area;
+                for (int row = 0; row < 3; ++row)
+                    for (int column = 0; column < 3; ++column)
+                        dynamic.nonlinearMatrix[3 * row + column] = coefficient *
+                            (localV[row] * localU[column] +
+                             localV[column] * localU[row]);
+            }
+
+            if (material.LamType == 2 && material.BHpoints > 0) {
+                const double fill = material.LamFill;
+                for (int local = 0; local < 3; ++local) {
+                    localB1 += L.solution()[nodes[local]] * qCached[local] / fill;
+                    localB2 += L.solution()[nodes[local]] * pCached[local];
+                }
+                const double fluxDensity = c * std::sqrt(
+                    localB1 * localB1 + localB2 * localB2) /
+                    (0.02 * cached.area);
+                blockproplist[static_cast<std::size_t>(block)]
+                    .GetBHProps(fluxDensity, localMu, localDv);
+                localMu = 1. / (muo * localMu);
+                element.mu2 = localMu * fill;
+                element.mu1 = localMu / (fill + localMu * (1. - fill));
+                for (int row = 0; row < 3; ++row) {
+                    for (int column = 0; column < 3; ++column) {
+                        localV[row] += (mx[3 * row + column] / fill +
+                                        my[3 * row + column]) *
+                                       L.solution()[nodes[column]];
+                        localU[row] += (mx[3 * row + column] / fill +
+                                        fill * my[3 * row + column]) *
+                                       L.solution()[nodes[column]];
+                    }
+                }
+                const double coefficient =
+                    -100. * c * c * c * localDv / cached.area;
+                for (int row = 0; row < 3; ++row)
+                    for (int column = 0; column < 3; ++column)
+                        dynamic.nonlinearMatrix[3 * row + column] = coefficient *
+                            (localV[row] * localU[column] +
+                             localV[column] * localU[row]);
+            }
+        }
+        lastStaticSolveTimings.nonlinearMaterialEvaluationMs +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - materialStarted).count();
+
+        // Compute independent local values in parallel. Global sparse/RHS
+        // accumulation follows serially in element order, preserving the
+        // legacy floating-point summation order and avoiding atomics.
+        const auto elementAssemblyStarted = std::chrono::steady_clock::now();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(assemblyThreads) if(assemblyThreads > 1)
+#endif
+        for (i = 0; i < NumEls; ++i) {
+            auto &element = meshele[static_cast<std::size_t>(i)];
+            const auto &cached = static2DElementAssemblyData[
+                static_cast<std::size_t>(i)];
+            auto &dynamic = static2DDynamicAssemblyData[
+                static_cast<std::size_t>(i)];
+            double localRhs[3];
+            double localMatrix[9];
+            for (int row = 0; row < 3; ++row) {
+                localRhs[row] = cached.fixedRhs[static_cast<std::size_t>(row)];
+                for (int column = 0; column < 3; ++column)
+                    localMatrix[3 * row + column] =
+                        cached.fixedMatrix[3 * row + column];
+            }
+
+            double circuitSource = 0.;
             if (cached.circuit >= 0) {
                 const auto &circuit = circproplist[
                     static_cast<std::size_t>(cached.circuit)];
                 if (circuit.Case == 1)
-                    t = circuit.J.re;
+                    circuitSource = circuit.J.re;
                 else if (circuit.Case == 0)
-                    t = -circuit.dV.re *
+                    circuitSource = -circuit.dV.re *
                         blockproplist[static_cast<std::size_t>(cached.block)].Cduct;
             }
-            const double circuitRhs = -t * a / 3.;
-            for (j = 0; j < 3; ++j) {
-                be[j] += circuitRhs;
-                // Preserve the legacy three-add ordering for incremental
-                // solution bookkeeping.
+            const double distributedRhs =
+                -circuitSource * cached.area / 3.;
+            for (int row = 0; row < 3; ++row) {
+                localRhs[row] += distributedRhs;
                 if (bIncremental == MS_LEGACY_FALSE)
-                    El->Jprev +=
+                    element.Jprev +=
                         (blockproplist[static_cast<std::size_t>(cached.block)].J.Re() +
-                         t) / 3.;
+                         circuitSource) / 3.;
             }
 
-//////// Nonlinear Part
-
-            const auto materialStarted = std::chrono::steady_clock::now();
-
-            // update permeability for the element;
-            if (Iter==0)
-            {
-                k = meshele[i].blk;
-
-                if (blockproplist[k].LamType==0)
-                {
-                    t = blockproplist[k].LamFill;
-                    meshele[i].mu1 = blockproplist[k].mu_x*t + (1.-t);
-                    meshele[i].mu2 = blockproplist[k].mu_y*t + (1.-t);
-                }
-                if (blockproplist[k].LamType==1)
-                {
-                    t = blockproplist[k].LamFill;
-                    mu = blockproplist[k].mu_x;
-                    meshele[i].mu1 = mu*t + (1.-t);
-                    meshele[i].mu2 = mu/(t + mu*(1.-t));
-                }
-                if (blockproplist[k].LamType==2)
-                {
-                    t = blockproplist[k].LamFill;
-                    mu = blockproplist[k].mu_y;
-                    meshele[i].mu2 = mu*t + (1.-t);
-                    meshele[i].mu1 = mu/(t + mu*(1.-t));
-                }
-                if (blockproplist[k].LamType>2)
-                {
-                    meshele[i].mu1 = 1;
-                    meshele[i].mu2 = 1;
-                }
-
-                if (blockproplist[k].BHpoints != 0)
-                {
-                    if (bIncremental == MS_LEGACY_FALSE)
-                    {
-                        // There's no previous solution.  This is a standard nonlinear problem
-                        LinearFlag = false;
-                    }
-                    else {
-                        double B1p, B2p;
-
-                        // too lazy to consistently code incremental/frozen formulation for on-edge lams.
-                        // detect this condition, throw an error, and exit.
-                        if (blockproplist[k].LamType > 0)
-                        {
-                            PrintMessage("On-edge Lam Types not yet supported in\nincremental/frozen permeability problems");
-                            exit(0);
-                        }
-
-                        //	Get B from previous solution
-                        getPrev2DB(i, B1p, B2p);
-                        B = sqrt(B1p*B1p + B2p*B2p);
-
-                        // look up incremental permeability and assign it to the element;
-                        blockproplist[k].IncrementalPermeability(B, muinc, murel);
-
-                        if (B == 0)
-                        {
-                            meshele[i].mu1 = muinc;
-                            meshele[i].mu2 = muinc;
-                            meshele[i].v12 = 0;
-                        }
-                        else {
-                            if (bIncremental == 1)
-                            {
-                                // Need to actually compute B1 and B2 to build incremental permeability tensor
-                                meshele[i].mu1 = B*B*muinc*murel / (B1p*B1p*murel + B2p*B2p*muinc);
-                                meshele[i].mu2 = B*B*muinc*murel / (B1p*B1p*muinc + B2p*B2p*murel);
-                                meshele[i].v12 = -B1p*B2p*(murel - muinc) / (B*B*murel*muinc);
-                            }
-                            else {
-                                // Define "frozen permeability"
-                                meshele[i].mu1 = murel;
-                                meshele[i].mu2 = murel;
-                                meshele[i].v12 = 0;
-                            }
-                        }
-                    }
-                }
-
-            }
-            if (Iter > 0 || (Iter == 0 && sweepWarmStartUsed))
-            {
-                k = meshele[i].blk;
-
-                if ((blockproplist[k].LamType==0) &&
-                        (meshele[i].mu1==meshele[i].mu2)
-                        &&(blockproplist[k].BHpoints>0))
-                {
-                    for(j = 0,B1 = 0.,B2 = 0.; j<3; j++)
-                    {
-                        B1+=L.solution()[n[j]]*q[j];
-                        B2+=L.solution()[n[j]]*p[j];
-                    }
-                    B = c*sqrt(B1*B1+B2*B2)/(0.02*a);
-                    // correction for lengths in cm of 1/0.02
-
-                    // find out new mu from saturation curve;
-                    blockproplist[k].GetBHProps(B,mu,dv);
-                    mu = 1./(muo*mu);
-                    meshele[i].mu1 = mu;
-                    meshele[i].mu2 = mu;
-                    for(j = 0; j<3; j++)
-                    {
-                        for(w = 0,v[j] = 0; w<3; w++)
-                            v[j]+=(Mx[j][w]+My[j][w])*L.solution()[n[w]];
-                    }
-                    K = -200.*c*c*c*dv/a;
-                    for(j = 0; j<3; j++)
-                    {
-                        for(w = 0; w<3; w++)
-                        {
-                            Mn[j][w] = K*v[j]*v[w];
-                        }
-                    }
-                }
-
-                if ((blockproplist[k].LamType==1) && (blockproplist[k].BHpoints>0))
-                {
-                    t = blockproplist[k].LamFill;
-
-                    for(j = 0,B1 = 0.,B2 = 0.; j<3; j++)
-                    {
-                        B1+=L.solution()[n[j]]*q[j];
-                        B2+=L.solution()[n[j]]*p[j]/t;
-                    }
-
-                    B = c*sqrt(B1*B1+B2*B2)/(0.02*a);
-
-                    blockproplist[k].GetBHProps(B,mu,dv);
-
-                    mu = 1./(muo*mu);
-
-                    meshele[i].mu1 = mu*t;
-
-                    meshele[i].mu2 = mu/(t+mu*(1.-t));
-
-                    for(j = 0; j<3; j++)
-                    {
-                        for(w = 0,v[j] = 0,u[j] = 0; w<3; w++)
-                        {
-                            v[j]+=(My[j][w]/t+Mx[j][w])*L.solution()[n[w]];
-                            u[j]+=(My[j][w]/t + t*Mx[j][w])*L.solution()[n[w]];
-                        }
-                    }
-
-                    K = -100.*c*c*c*dv/(a);
-
-                    for(j = 0; j<3; j++)
-                    {
-                        for(w = 0; w<3; w++)
-                        {
-                            Mn[j][w] = K*(v[j]*u[w]+v[w]*u[j]);
-                        }
-                    }
-                }
-                if ((blockproplist[k].LamType==2) && (blockproplist[k].BHpoints>0))
-                {
-                    t = blockproplist[k].LamFill;
-
-                    for(j = 0,B1 = 0.,B2 = 0.; j<3; j++)
-                    {
-                        B1+=(L.solution()[n[j]]*q[j])/t;
-                        B2+=L.solution()[n[j]]*p[j];
-                    }
-
-                    B = c*sqrt(B1*B1+B2*B2)/(0.02*a);
-
-                    blockproplist[k].GetBHProps(B,mu,dv);
-
-                    mu = 1./(muo*mu);
-
-                    meshele[i].mu2 = mu*t;
-
-                    meshele[i].mu1 = mu/(t+mu*(1.-t));
-
-                    for(j = 0; j<3; j++)
-                    {
-                        for(w = 0,v[j] = 0,u[j] = 0; w<3; w++)
-                        {
-                            v[j]+=(Mx[j][w]/t + My[j][w])*L.solution()[n[w]];
-                            u[j]+=(Mx[j][w]/t + t*My[j][w])*L.solution()[n[w]];
-                        }
-                    }
-
-                    K = -100.*c*c*c*dv/(a);
-
-                    for(j = 0; j<3; j++)
-                    {
-                        for(w = 0; w<3; w++)
-                        {
-                            Mn[j][w] = K*(v[j]*u[w]+v[w]*u[j]);
-                        }
-                    }
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 3; ++column) {
+                    const std::size_t slot = static_cast<std::size_t>(
+                        3 * row + column);
+                    localMatrix[slot] +=
+                        cached.mx[slot] / Re(element.mu2) +
+                        cached.my[slot] / Re(element.mu1) +
+                        cached.mxy[slot] * Re(element.v12) +
+                        dynamic.nonlinearMatrix[slot];
+                    localRhs[row] += dynamic.nonlinearMatrix[slot] *
+                        L.solution()[cached.nodes[static_cast<std::size_t>(column)]];
                 }
             }
-            lastStaticSolveTimings.nonlinearMaterialEvaluationMs +=
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - materialStarted).count();
-
-            // combine block matrices into global matrices;
-            for (j = 0; j<3; j++)
-                for (k = 0; k<3; k++)
-                {
-                    Me[j][k]+= (Mx[j][k]/Re(El->mu2) + My[j][k]/Re(El->mu1) + Mxy[j][k] * Re(El->v12) + Mn[j][k]);
-                    be[j]+=Mn[j][k]*L.solution()[n[k]];
-                }
-
-            double upperElementValues[6];
-            std::size_t upperEntry = 0;
-            for (j = 0; j < 3; ++j)
-                for (k = j; k < 3; ++k)
-                    upperElementValues[upperEntry++] = -Me[j][k];
-            L.add_symmetric_3x3(static_cast<std::size_t>(i), n,
-                                upperElementValues);
-            for (j = 0; j < 3; ++j)
-                L.rhs()[n[j]] -= be[j];
+            std::size_t upper = 0;
+            for (int row = 0; row < 3; ++row)
+                for (int column = row; column < 3; ++column)
+                    dynamic.upperMatrix[upper++] =
+                        -localMatrix[3 * row + column];
+            for (int row = 0; row < 3; ++row)
+                dynamic.rhs[static_cast<std::size_t>(row)] = -localRhs[row];
         }
-        const double elementAssemblyElapsed =
+
+        for (i = 0; i < NumEls; ++i) {
+            const auto &cached = static2DElementAssemblyData[
+                static_cast<std::size_t>(i)];
+            const auto &dynamic = static2DDynamicAssemblyData[
+                static_cast<std::size_t>(i)];
+            L.add_symmetric_3x3(static_cast<std::size_t>(i),
+                                cached.nodes.data(),
+                                dynamic.upperMatrix.data());
+            for (j = 0; j < 3; ++j)
+                L.rhs()[cached.nodes[static_cast<std::size_t>(j)]] +=
+                    dynamic.rhs[static_cast<std::size_t>(j)];
+        }
+        lastStaticSolveTimings.elementMatrixAssemblyMs +=
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - elementAssemblyStarted).count();
-        const double elementMaterialElapsed =
-            lastStaticSolveTimings.nonlinearMaterialEvaluationMs -
-            elementMaterialBefore;
-        lastStaticSolveTimings.elementMatrixAssemblyMs +=
-            elementAssemblyElapsed > elementMaterialElapsed
-                ? elementAssemblyElapsed - elementMaterialElapsed : 0.0;
 
         // add in contribution from point currents;
         const auto rhsConstructionStarted = std::chrono::steady_clock::now();

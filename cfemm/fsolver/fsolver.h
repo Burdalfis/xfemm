@@ -174,10 +174,18 @@ private:
         int circuit = -1;
     };
 
+    struct Static2DDynamicAssemblyData
+    {
+        std::array<double, 9> nonlinearMatrix{};
+        std::array<double, 6> upperMatrix{};
+        std::array<double, 3> rhs{};
+    };
+
     void prepareStatic2DAssemblyData();
     void invalidateStatic2DAssemblyData()
     {
         static2DElementAssemblyData.clear();
+        static2DDynamicAssemblyData.clear();
     }
 
     virtual void CleanUp() override;
@@ -225,6 +233,7 @@ private:
     double lastNewtonRelativeUpdate = 0;
     StaticSolveTimings lastStaticSolveTimings;
     std::vector<Static2DElementAssemblyData> static2DElementAssemblyData;
+    std::vector<Static2DDynamicAssemblyData> static2DDynamicAssemblyData;
 };
 
 /////////////////////////////////////////////////////////////////////////////

@@ -154,3 +154,99 @@ torque error 1.27e-11 N m. Tangent validation retained 2.58e-11 H maximum
 absolute centered-FD error and 2.87e-6 maximum relative error. The compact
 sparse unit regression also compares direct six-entry element assembly against
 the scalar reference before and after a numerical wipe.
+
+## Threaded element/material assembly
+
+Four accumulation designs were considered for the fixed graph:
+
+- A private full CSR plus RHS per thread is simple but would replicate roughly
+  6.1 MB per thread for this mesh and require a bandwidth-heavy whole-matrix
+  reduction after every Newton iteration.
+- Element coloring permits concurrent direct scatter, but changes the global
+  accumulation order and adds a parallel launch for every color.
+- Row ownership avoids matrix races but either duplicates cross-partition
+  element arithmetic or requires a second contribution exchange.
+- Retaining one compact local contribution per element permits both material
+  interpolation and local matrix/RHS calculation to run independently, then
+  performs a serial element-order scatter. This has bounded storage, no
+  atomics, and preserves the legacy global summation order exactly.
+
+The fourth strategy was selected. Material/B-H interpolation is now a distinct
+parallel pass, so the material timing no longer includes two clock calls per
+element. Local matrix/RHS values are computed in a second static-scheduled
+parallel pass, and their retained values are accumulated in original element
+order. `XFEMM_ASSEMBLY_THREADS` overrides only assembly; the older
+`XFEMM_NUM_THREADS` is accepted as a fallback. With neither set, OpenMP uses up
+to 16 threads, the measured optimum on the target 16-logical-CPU machine.
+Concurrent multi-process workloads can explicitly divide the CPUs with
+`XFEMM_ASSEMBLY_THREADS`.
+
+The threaded algorithm has a one-thread cost of 162.484 ms because retaining
+per-element values adds a second memory pass. Thread speedups below therefore
+use that like-for-like algorithmic baseline; the separate 149.009 ms result
+above remains the serial-algorithm baseline.
+
+| threads | material ms | complete matrix ms | volume element ms | evaluation ms | program CPU | speedup vs threaded 1T |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 35.336 | 73.726 | 50.574 | 162.484 | 99% | 1.000x |
+| 2 | 23.877 | 61.867 | 39.101 | 139.565 | 115% | 1.164x |
+| 4 | 17.882 | 58.409 | 35.318 | 129.919 | 138% | 1.251x |
+| 8 | 11.799 | 59.341 | 36.273 | 124.835 | 164% | 1.302x |
+| 16 | 11.416 | 51.302 | 28.339 | 116.572 | 190% | 1.394x |
+
+The CPU percentage is for the complete benchmark including cold setup,
+serial postprocessing, GPU waits, and bucket work; it is not the utilization
+inside the two parallel loops. At 16 threads, sparse packing was 13.200 ms,
+cuDSS factorization 20.371 ms, and cuDSS solve 3.108 ms. Those remain consistent
+with the single-thread values (13.175, 20.258, and 3.093 ms respectively).
+
+Against the original 221.773 ms Section-3 baseline, the selected host path is
+1.902x faster. The algorithmic precompute/direct-entry change accounts for
+1.488x on its own; threading improves the new threaded representation by
+1.394x, or the serial optimized path by 1.278x. These factors are reported
+separately because their baselines differ.
+
+## Final breakdown and CUDA decision gate
+
+A final selected-default repeat measured 116.591 ms/evaluation. Its hot
+ResidualOnly breakdown was:
+
+| Region | ms | share |
+|---|---:|---:|
+| nonlinear material/B-H | 10.734 | 9.21% |
+| volume element matrix/RHS | 29.092 | 24.95% |
+| AGE matrix | 1.996 | 1.71% |
+| explicit RHS | 1.171 | 1.00% |
+| boundary constraints | 15.256 | 13.09% |
+| other matrix-construction work | 4.673 | 4.01% |
+| sparse pack/scatter | 13.217 | 11.34% |
+| H2D / cuDSS factor / solve / D2H | 2.126 / 20.337 / 3.099 / 0.509 | 22.36% total |
+| residual / nonlinear bookkeeping / packaging | 5.785 / 1.451 / 1.197 | 7.23% total |
+| direct linkage | 0.282 | 0.24% |
+| unaccounted | 5.588 | 4.79% |
+
+The remaining material plus volume-element work is 39.826 ms, or 34.16% of
+the evaluation. Eliminating only that work has an ideal Amdahl ceiling of
+1.519x additional speedup. A persistent device assembly path could also avoid
+most of the 13.217 ms host pack/scatter and 2.126 ms H2D stages; eliminating
+all three has a less realistic upper ceiling of 1.90x. During a 30%-duty live
+transient the GPU sampled 15-28% SM and 1-2% memory utilization, so device
+headroom remains.
+
+GPU assembly is therefore still worth a bounded Section-5 investigation, but
+not an unmeasured rewrite. The simplified host path gives the implementation
+shape: upload immutable element nodes, six CSR destinations, geometric
+matrices, fixed sources, material/circuit IDs, and B-H tables once; keep the
+nodal iterate and CSR values resident; clear values on device; evaluate
+material and six local entries per element; and reduce directly into the
+cuDSS numeric values. A deterministic segmented/color reduction should be
+benchmarked against FP64 atomics. AGE and boundary transformations can remain
+host-driven initially only if their contributions can be applied without a
+full matrix round trip. cuDSS must consume the resulting resident values
+directly. Section 4 does not implement this path.
+
+The CPU/cuDSS persistent test, tangent centered-FD validation, compact sparse
+tests, and live motor transient/cache/bridge tests pass with the selected
+thread count. ASan plus UBSan unit/analytical runs also pass; LeakSanitizer is
+not usable under the application ptrace environment and was disabled for the
+ASan run.
