@@ -1,2 +1,0 @@
-/usr/bin/ar qc libhpproc.a CMakeFiles/hpproc.dir/hpproc.cpp.o CMakeFiles/hpproc.dir/CHPointVals.cpp.o
-/usr/bin/ranlib libhpproc.a

@@ -1,2 +1,0 @@
-/usr/bin/ar qc libhsolver.a CMakeFiles/hsolver.dir/hsolver.cpp.o
-/usr/bin/ranlib libhsolver.a

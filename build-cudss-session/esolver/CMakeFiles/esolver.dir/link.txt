@@ -1,2 +1,0 @@
-/usr/bin/ar qc libesolver.a CMakeFiles/esolver.dir/esolver.cpp.o
-/usr/bin/ranlib libesolver.a

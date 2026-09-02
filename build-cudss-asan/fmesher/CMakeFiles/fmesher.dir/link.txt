@@ -1,2 +1,0 @@
-/usr/bin/ar qc libfmesher.a CMakeFiles/fmesher.dir/fmesher.cpp.o CMakeFiles/fmesher.dir/nosebl.cpp.o CMakeFiles/fmesher.dir/TangleMeshConverter.cpp.o CMakeFiles/fmesher.dir/TangleMesherBackend.cpp.o CMakeFiles/fmesher.dir/TriangleMesher.cpp.o CMakeFiles/fmesher.dir/TriangleMesherBackend.cpp.o CMakeFiles/fmesher.dir/writepoly.cpp.o
-/usr/bin/ranlib libfmesher.a

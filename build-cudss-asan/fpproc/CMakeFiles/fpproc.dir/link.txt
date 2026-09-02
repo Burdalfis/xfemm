@@ -1,2 +1,0 @@
-/usr/bin/ar qc libfpproc.a CMakeFiles/fpproc.dir/fpproc.cpp.o CMakeFiles/fpproc.dir/makemask.cpp.o CMakeFiles/fpproc.dir/CMPointVals.cpp.o CMakeFiles/fpproc.dir/CPostProcMElement.cpp.o CMakeFiles/fpproc.dir/MagneticSolutionSnapshot.cpp.o CMakeFiles/fpproc.dir/InMemorySolution.cpp.o CMakeFiles/fpproc.dir/PersistentMotorSession.cpp.o
-/usr/bin/ranlib libfpproc.a
